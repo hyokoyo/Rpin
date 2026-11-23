@@ -1,0 +1,21 @@
+# Cargo build output
+/target/
+
+# Local screenshot diagnostics output
+/rpin-capture-*/
+
+# Local MinGW workaround files
+/.mingw-shim/
+
+# Per-developer IDE state
+/.vs/
+/.idea/
+/.vscode/
+
+# Windows Explorer metadata
+Thumbs.db
+Desktop.ini
+
+# Internal planning and development notes
+/开发文档.md
+/开发说明.md
