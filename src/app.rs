@@ -9,7 +9,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     DestroyWindow, GWLP_USERDATA, GetWindowLongPtrW, IsWindow, PostQuitMessage,
     RegisterWindowMessageW, WM_APP, WM_CLOSE, WM_CONTEXTMENU, WM_COPYDATA, WM_DESTROY,
     WM_DISPLAYCHANGE, WM_ENDSESSION, WM_HOTKEY, WM_LBUTTONUP, WM_POWERBROADCAST,
-    WM_QUERYENDSESSION, WM_RBUTTONUP,
+    WM_QUERYENDSESSION, WM_RBUTTONUP, WM_TIMER,
 };
 use windows::core::w;
 
@@ -24,7 +24,7 @@ use crate::logging::Level;
 use crate::output::png::Compression;
 use crate::output::png_writer::{SaveWorker, WM_SAVE_DONE};
 use crate::output::{OutputAction, OutputError, SelectionOutcome, crop, filename};
-use crate::overlay::{Overlay, WM_SELECTION_FINISHED};
+use crate::overlay::{DIRECT2D_IDLE_TIMER, Direct2dCache, Overlay, WM_SELECTION_FINISHED};
 use crate::pins::NativePinManager;
 use crate::platform::hotkey::Hotkey;
 use crate::platform::single_instance::{SingleInstance, read_copy_data};
@@ -67,6 +67,7 @@ pub struct App {
     exit_requested: bool,
     exit_code: i32,
     overlay: Option<Overlay>,
+    direct2d: Direct2dCache,
     saver: SaveWorker,
     pins: NativePinManager,
     /// Keeps the named mutex alive for the process lifetime.
@@ -99,6 +100,7 @@ impl App {
             exit_requested: false,
             exit_code: 0,
             overlay: None,
+            direct2d: Direct2dCache::new(hwnd),
             saver: SaveWorker::default(),
             pins: NativePinManager::new(hwnd),
             _single_instance: single_instance,
@@ -222,16 +224,22 @@ impl App {
         let frames = GdiCapture::new().capture_all();
         self.pins.restore_after_capture();
         match frames.map_err(anyhow::Error::from).and_then(|frames| {
+            let factory = self.direct2d.factory()?;
             Overlay::show(
                 self.hwnd,
                 frames,
                 self.config.ui.clone(),
                 default_action,
                 started,
+                factory,
             )
         }) {
             Ok(overlay) => self.overlay = Some(overlay),
-            Err(err) => self.report_capture_error(err),
+            Err(err) => {
+                self.direct2d
+                    .start_idle(self.config.ui.direct2d_idle_seconds);
+                self.report_capture_error(err);
+            }
         }
     }
 
@@ -275,7 +283,7 @@ impl App {
         let Some(result) = self.overlay.as_mut().and_then(Overlay::take_outcome) else {
             return;
         };
-        self.overlay.take();
+        self.close_overlay();
         match result {
             Ok((SelectionOutcome::Confirmed { rect, action }, frames)) => {
                 crate::logging::info(format!("selection confirmed: {rect:?}, action={action:?}"));
@@ -288,6 +296,14 @@ impl App {
             }
             Ok((SelectionOutcome::Cancelled, _)) => crate::logging::debug("selection cancelled"),
             Err(err) => self.report_capture_error(err),
+        }
+    }
+
+    fn close_overlay(&mut self) {
+        let was_open = self.overlay.take().is_some();
+        if was_open {
+            self.direct2d
+                .start_idle(self.config.ui.direct2d_idle_seconds);
         }
     }
 
@@ -477,6 +493,8 @@ impl App {
         }
         crate::logging::set_level(&config.app.log_level);
         self.config = config;
+        self.direct2d
+            .update_timer(self.config.ui.direct2d_idle_seconds);
         self.autostart_enabled = autostart::is_enabled();
         self.register_hotkeys();
         crate::logging::info("config reloaded");
@@ -591,6 +609,11 @@ impl App {
                 self.finish_selection();
                 LRESULT(0)
             }
+            WM_TIMER if wparam.0 == DIRECT2D_IDLE_TIMER => {
+                self.direct2d
+                    .update_timer(self.config.ui.direct2d_idle_seconds);
+                LRESULT(0)
+            }
             WM_SAVE_DONE => {
                 self.finish_save();
                 LRESULT(0)
@@ -605,7 +628,7 @@ impl App {
                 LRESULT(0)
             }
             WM_DISPLAYCHANGE => {
-                self.overlay.take();
+                self.close_overlay();
                 crate::logging::info("WM_DISPLAYCHANGE received");
                 LRESULT(0)
             }
@@ -623,6 +646,7 @@ impl App {
             }
             WM_DESTROY => {
                 self.overlay.take();
+                self.direct2d.clear();
                 self.pins.close_all();
                 self.saver.shutdown();
                 crate::logging::info("main window destroyed; exiting");
@@ -642,6 +666,7 @@ impl App {
 impl Drop for App {
     fn drop(&mut self) {
         self.overlay.take();
+        self.direct2d.clear();
         self.saver.shutdown();
         for binding in self.hotkeys.drain(..) {
             hotkey::unregister(self.hwnd, binding.id);

@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{
     D2DERR_RECREATE_TARGET, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
 };
+use windows::Win32::Graphics::Direct2D::ID2D1Factory;
 use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, InvalidateRect, PAINTSTRUCT};
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -61,6 +62,7 @@ struct Session {
     cursor: Point,
     scene: Scene,
     renderer: Option<Renderer>,
+    factory: ID2D1Factory,
     recovering: bool,
     outcome: Option<anyhow::Result<SelectionOutcome>>,
     shown: Instant,
@@ -77,6 +79,7 @@ impl Overlay {
         ui: UiConfig,
         default_action: OutputAction,
         started: Instant,
+        factory: ID2D1Factory,
     ) -> anyhow::Result<Self> {
         let bounds = frames
             .iter()
@@ -110,7 +113,7 @@ impl Overlay {
                 None,
             )?
         };
-        let renderer = match Renderer::new(hwnd, bounds, &frames, &ui) {
+        let renderer = match Renderer::new(&factory, hwnd, bounds, &frames, &ui) {
             Ok(renderer) => renderer,
             Err(err) => {
                 // SAFETY: the window was created above and has no session attached.
@@ -131,6 +134,7 @@ impl Overlay {
             default_action,
             pressed_button: None,
             renderer: Some(renderer),
+            factory,
             recovering: false,
             outcome: None,
             shown: Instant::now(),
@@ -306,7 +310,13 @@ impl Session {
 
     fn draw(&mut self, hwnd: HWND, dirty: RECT) -> anyhow::Result<()> {
         let dirty = if self.renderer.is_none() {
-            self.renderer = Some(Renderer::new(hwnd, self.bounds, &self.frames, &self.ui)?);
+            self.renderer = Some(Renderer::new(
+                &self.factory,
+                hwnd,
+                self.bounds,
+                &self.frames,
+                &self.ui,
+            )?);
             self.bounds
         } else {
             Rect::new(dirty.left, dirty.top, dirty.right, dirty.bottom)

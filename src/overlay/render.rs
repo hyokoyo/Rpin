@@ -6,11 +6,10 @@ use windows::Win32::Graphics::Direct2D::Common::{
 };
 use windows::Win32::Graphics::Direct2D::{
     D2D1_ANTIALIAS_MODE_ALIASED, D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
-    D2D1_BITMAP_PROPERTIES, D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_FACTORY_TYPE_SINGLE_THREADED,
-    D2D1_HWND_RENDER_TARGET_PROPERTIES, D2D1_PRESENT_OPTIONS_IMMEDIATELY,
-    D2D1_PRESENT_OPTIONS_NONE, D2D1_PRESENT_OPTIONS_RETAIN_CONTENTS, D2D1_RENDER_TARGET_PROPERTIES,
-    D2D1_ROUNDED_RECT, D2D1CreateFactory, ID2D1Bitmap, ID2D1Factory, ID2D1HwndRenderTarget,
-    ID2D1SolidColorBrush, ID2D1StrokeStyle,
+    D2D1_BITMAP_PROPERTIES, D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_HWND_RENDER_TARGET_PROPERTIES,
+    D2D1_PRESENT_OPTIONS_IMMEDIATELY, D2D1_PRESENT_OPTIONS_NONE,
+    D2D1_PRESENT_OPTIONS_RETAIN_CONTENTS, D2D1_RENDER_TARGET_PROPERTIES, D2D1_ROUNDED_RECT,
+    ID2D1Bitmap, ID2D1Factory, ID2D1HwndRenderTarget, ID2D1SolidColorBrush, ID2D1StrokeStyle,
 };
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
@@ -27,7 +26,6 @@ use crate::config::UiConfig;
 use super::scene::{Label, Magnifier, Scene, Toolbar, handles, scaled};
 
 thread_local! {
-    static D2D: OnceCell<ID2D1Factory> = const { OnceCell::new() };
     static DWRITE: OnceCell<IDWriteFactory> = const { OnceCell::new() };
 }
 
@@ -81,6 +79,7 @@ struct TextFormats {
 
 impl Renderer {
     pub(super) fn new(
+        factory: &ID2D1Factory,
         hwnd: HWND,
         bounds: Rect,
         frames: &[CapturedMonitor],
@@ -100,16 +99,6 @@ impl Renderer {
             },
             presentOptions: D2D1_PRESENT_OPTIONS_RETAIN_CONTENTS | D2D1_PRESENT_OPTIONS_IMMEDIATELY,
         };
-        let factory = D2D.with(|cell| {
-            if let Some(factory) = cell.get() {
-                return Ok(factory.clone());
-            }
-            // SAFETY: this factory is created and used on the UI thread.
-            let factory: ID2D1Factory =
-                unsafe { D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)? };
-            let _ = cell.set(factory.clone());
-            Ok::<_, windows::core::Error>(factory)
-        })?;
         // SAFETY: hwnd and the property structures are valid for both calls.
         let (target, retained) = unsafe {
             match factory.CreateHwndRenderTarget(&properties, &window) {
@@ -496,7 +485,8 @@ mod tests {
             )?
         };
         let paint = (|| {
-            let renderer = Renderer::new(hwnd, bounds, &frames, &ui)?;
+            let mut cache = crate::overlay::Direct2dCache::new(hwnd);
+            let renderer = Renderer::new(&cache.factory()?, hwnd, bounds, &frames, &ui)?;
             renderer.paint(bounds, &frames, &scene)?;
             renderer.paint(Rect::new(0, 90, 220, 150), &frames, &scene)?;
             Ok(())

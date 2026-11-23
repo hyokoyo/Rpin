@@ -28,6 +28,8 @@ cargo build --release --locked
 
 快捷键、通知、保存选项和贴图默认行为可在配置文件中设置。配置格式可参考首次启动生成的 `config.toml`；修改后从托盘菜单选择“重新加载配置”。
 
+关闭选区后，RPin 默认保留 Direct2D 渲染资源 60 秒，供连续截图复用。可在已有的 `[ui]` 段中设置 `direct2d_idle_seconds = 60`，单位为秒，设为 `0` 时关闭选区后立即释放。重新加载配置后生效。
+
 ## 许可证
 
 本项目使用 MIT 许可证，详见 [LICENSE](LICENSE)。

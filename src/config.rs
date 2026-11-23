@@ -78,6 +78,8 @@ pub struct UiConfig {
     pub dim_alpha: f32,
     pub show_size: bool,
     pub show_rgb: bool,
+    /// Time to keep the selection renderer's Direct2D factory after closing.
+    pub direct2d_idle_seconds: u32,
 }
 
 impl Default for UiConfig {
@@ -88,6 +90,7 @@ impl Default for UiConfig {
             dim_alpha: 0.45,
             show_size: true,
             show_rgb: true,
+            direct2d_idle_seconds: 60,
         }
     }
 }
