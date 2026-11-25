@@ -3,7 +3,7 @@ use std::io::{BufWriter, ErrorKind};
 use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -31,6 +31,13 @@ pub struct SaveWorker {
 }
 
 impl SaveWorker {
+    #[cfg(test)]
+    pub(crate) fn simulate_pending(&mut self) -> mpsc::Sender<anyhow::Result<PathBuf>> {
+        let (sender, receiver) = mpsc::channel();
+        self.pending = Some(receiver);
+        sender
+    }
+
     pub fn busy(&self) -> bool {
         self.pending.is_some()
     }
@@ -83,9 +90,25 @@ impl SaveWorker {
         Some(result)
     }
 
+    pub fn wait_for_session_end(&mut self) -> Option<anyhow::Result<PathBuf>> {
+        // Windows can terminate the process as soon as WM_ENDSESSION returns.
+        // Give the save a short chance to finish without holding up system shutdown.
+        let result = match self.pending.as_ref()?.recv_timeout(Duration::from_secs(2)) {
+            Ok(result) => result,
+            Err(RecvTimeoutError::Timeout) => return None,
+            Err(RecvTimeoutError::Disconnected) => {
+                Err(anyhow::anyhow!("image save worker disconnected"))
+            }
+        };
+        self.pending = None;
+        Some(result)
+    }
+
     pub fn shutdown(&mut self) {
         if let Some(receiver) = self.pending.take() {
-            match receiver.recv_timeout(Duration::from_secs(2)) {
+            // Normal exit keeps the message loop running until take_result
+            // completes. This also drains the save if the window or loop fails.
+            match receiver.recv() {
                 Ok(Ok(path)) => crate::logging::info(format!("saved {}", path.display())),
                 Ok(Err(err)) => crate::logging::error(format!("save failed: {err:#}")),
                 Err(err) => {

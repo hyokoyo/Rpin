@@ -26,7 +26,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{PCWSTR, w};
 
-use crate::annotation::{Document, Editor, Tool, local_point};
+use crate::annotation::{Document, Tool};
 use crate::capture::{
     CapturedMonitor,
     frame::{Point, Rect},
@@ -35,9 +35,10 @@ use crate::config::UiConfig;
 use crate::output::{OutputAction, SelectionOutcome};
 use crate::platform::window::{default_proc, hinstance};
 
-use super::input::{Handle, Hit, Selection};
+use super::input::{Handle, Hit};
+use super::interaction::{Change, Interaction};
 use super::render::Renderer;
-use super::scene::{Scene, ToolbarButton, ToolbarState, hit_test};
+use super::scene::{Scene, ToolbarButton, hit_test};
 use super::style::{choose_color, choose_size, choose_width};
 use super::text::{EN_CHANGE, TextInput, WM_TEXT_CHANGED, WM_TEXT_FINISHED, edit_colors};
 
@@ -66,14 +67,9 @@ struct Session {
     frames: Vec<CapturedMonitor>,
     bounds: Rect,
     ui: UiConfig,
-    selection: Selection,
-    editor: Editor,
+    interaction: Interaction,
     text: Option<TextInput>,
-    text_resize: Option<i32>,
     custom_colors: [COLORREF; 16],
-    default_action: OutputAction,
-    pressed_button: Option<ToolbarButton>,
-    cursor: Point,
     scene: Scene,
     renderer: Option<Renderer>,
     factory: ID2D1Factory,
@@ -106,8 +102,8 @@ impl Overlay {
             "virtual desktop exceeds the overlay limit (16384px)"
         );
         let cursor = cursor_position().unwrap_or(Point::new(bounds.left, bounds.top));
-        let selection = Selection::default();
-        let scene = Scene::new(&frames, &ui, &selection, cursor, ToolbarState::default());
+        let interaction = Interaction::new(cursor, default_action);
+        let scene = interaction.scene(&frames, &ui);
         let instance = register_class()?;
         // SAFETY: the class is registered and the top-level window uses
         // virtual-desktop physical pixels under the Per-Monitor V2 manifest.
@@ -142,15 +138,10 @@ impl Overlay {
             frames,
             bounds,
             ui,
-            cursor,
             scene,
-            selection,
-            editor: Editor::default(),
+            interaction,
             text: None,
-            text_resize: None,
             custom_colors: [COLORREF(0x00ff_ffff); 16],
-            default_action,
-            pressed_button: None,
             renderer: Some(renderer),
             factory,
             recovering: false,
@@ -191,7 +182,7 @@ impl Overlay {
             SelectionResult {
                 outcome,
                 frames,
-                annotations: session.editor.take_document(),
+                annotations: session.interaction.take_document(),
             }
         }))
     }
@@ -248,30 +239,8 @@ impl Session {
         }
     }
 
-    fn confirm(&mut self, action: OutputAction) {
-        if !self.selection.dragging() && !self.editor.dragging() {
-            if let Some(rect) = self.selection.saved_rect() {
-                self.finish(Ok(SelectionOutcome::Confirmed { rect, action }));
-            }
-        }
-    }
-
     fn refresh(&mut self, hwnd: HWND) {
-        let mut next = Scene::new(
-            &self.frames,
-            &self.ui,
-            &self.selection,
-            self.cursor,
-            ToolbarState {
-                pressed: self.pressed_button,
-                active_tool: self.editor.tool,
-                can_undo: self.editor.can_undo(),
-                can_redo: self.editor.can_redo(),
-                editing: self.editor.locks_selection(),
-                text_style: self.editor.text_style,
-                stroke_style: self.editor.stroke_style,
-            },
-        );
+        let mut next = self.interaction.scene(&self.frames, &self.ui);
         next.text_grip = self
             .text
             .as_ref()
@@ -300,7 +269,7 @@ impl Session {
     }
 
     fn invalidate_annotation(&self, hwnd: HWND, local: Option<Rect>) {
-        if let (Some(local), Some(selection)) = (local, self.selection.saved_rect()) {
+        if let (Some(local), Some(selection)) = (local, self.interaction.selection()) {
             if let Some(rect) = local
                 .offset(selection.left, selection.top)
                 .intersect(selection)
@@ -311,7 +280,7 @@ impl Session {
     }
 
     fn paint(&mut self, hwnd: HWND) {
-        let started = ((self.selection.dragging() || self.editor.dragging())
+        let started = (self.interaction.dragging_canvas()
             && crate::logging::current_level() >= crate::logging::Level::Debug)
             .then(Instant::now);
         let paint = match Paint::begin(hwnd) {
@@ -375,7 +344,7 @@ impl Session {
                 dirty,
                 &self.frames,
                 &self.scene,
-                Some((&self.factory, &self.editor)),
+                Some((&self.factory, self.interaction.editor())),
             )?;
         }
         Ok(())
@@ -399,44 +368,41 @@ impl Session {
             )
         };
         let step = if shift { 10 } else { 1 };
-        let delta = match key {
-            VK_ESCAPE if self.editor.dragging() => {
-                let damage = self.editor.cancel_gesture();
-                self.invalidate_annotation(hwnd, damage);
-                self.release_mouse(hwnd);
-                return self.refresh(hwnd);
+        let change = match key {
+            VK_ESCAPE => {
+                let (change, release) = self.interaction.escape();
+                if release {
+                    self.release_mouse(hwnd);
+                }
+                change
             }
-            VK_ESCAPE => return self.finish(Ok(SelectionOutcome::Cancelled)),
-            VK_RETURN => return self.confirm(self.default_action),
-            VK_S if ctrl => return self.confirm(OutputAction::SaveAs),
-            VK_T if ctrl => return self.confirm(OutputAction::PinAndCopy),
-            VK_T => return self.confirm(OutputAction::Pin),
+            VK_RETURN => self.interaction.confirm_default(),
+            VK_S if ctrl => self.interaction.confirm(OutputAction::SaveAs),
+            VK_T if ctrl => self.interaction.confirm(OutputAction::PinAndCopy),
+            VK_T => self.interaction.confirm(OutputAction::Pin),
             VK_Z if ctrl => return self.history(hwnd, shift),
             VK_Y if ctrl => return self.history(hwnd, true),
-            VK_LEFT => Point::new(-step, 0),
-            VK_RIGHT => Point::new(step, 0),
-            VK_UP => Point::new(0, -step),
-            VK_DOWN => Point::new(0, step),
-            _ => return,
+            VK_LEFT => self
+                .interaction
+                .nudge(self.bounds, Point::new(-step, 0), ctrl),
+            VK_RIGHT => self
+                .interaction
+                .nudge(self.bounds, Point::new(step, 0), ctrl),
+            VK_UP => self
+                .interaction
+                .nudge(self.bounds, Point::new(0, -step), ctrl),
+            VK_DOWN => self
+                .interaction
+                .nudge(self.bounds, Point::new(0, step), ctrl),
+            _ => Change::None,
         };
-        if !self.editor.locks_selection() {
-            self.selection.nudge(self.bounds, delta, ctrl);
-            self.refresh(hwnd);
-        }
+        self.apply_change(hwnd, change);
     }
 
     fn history(&mut self, hwnd: HWND, redo: bool) {
-        if self.editor.dragging() {
-            return;
-        }
         self.finish_text(hwnd, true);
-        let damage = if redo {
-            self.editor.redo()
-        } else {
-            self.editor.undo()
-        };
-        self.invalidate_annotation(hwnd, damage);
-        self.refresh(hwnd);
+        let change = self.interaction.history(redo);
+        self.apply_change(hwnd, change);
     }
 
     fn release_mouse(&self, hwnd: HWND) {
@@ -448,53 +414,33 @@ impl Session {
         }
     }
 
-    fn begin_edit(&mut self, hwnd: HWND, point: Point) {
-        let (Some(tool), Some(selection)) = (self.editor.tool, self.selection.saved_rect()) else {
-            return;
-        };
-        if !selection.contains(point) || self.editor.dragging() {
-            return;
-        }
-        let point = local_point(point, selection);
-        if tool == Tool::Text {
-            let canvas = selection.offset(-self.bounds.left, -self.bounds.top);
-            let toolbar = self
-                .scene
-                .toolbar
-                .map(|bar| bar.rect.offset(-self.bounds.left, -self.bounds.top));
-            match TextInput::new(hwnd, canvas, point, self.editor.text_style, toolbar) {
-                Ok(input) => self.text = Some(input),
-                Err(err) => {
-                    crate::logging::warn(format!("could not open annotation text input: {err:#}"))
-                }
+    fn open_text(&mut self, hwnd: HWND, selection: Rect, local: Point) {
+        let canvas = selection.offset(-self.bounds.left, -self.bounds.top);
+        let toolbar = self
+            .scene
+            .toolbar
+            .map(|bar| bar.rect.offset(-self.bounds.left, -self.bounds.top));
+        let style = self.interaction.editor().text_style;
+        match TextInput::new(hwnd, canvas, local, style, toolbar) {
+            Ok(input) => self.text = Some(input),
+            Err(err) => {
+                crate::logging::warn(format!("could not open annotation text input: {err:#}"))
             }
-        } else {
-            // SAFETY: capture the gesture until mouse-up on this thread.
-            unsafe {
-                SetCapture(hwnd);
-                if GetCapture() != hwnd {
-                    return;
-                }
-            }
-            let damage = self.editor.begin(tool, point);
-            self.invalidate_annotation(hwnd, Some(damage));
         }
-        self.refresh(hwnd);
     }
 
     fn finish_text(&mut self, hwnd: HWND, commit: bool) {
         let Some(mut text) = self.text.take() else {
             return;
         };
-        if self.text_resize.take().is_some() {
+        if self.interaction.end_text_resize() {
             self.release_mouse(hwnd);
         }
         let damage = if commit {
             if let Err(err) = text.text_changed() {
                 crate::logging::warn(format!("could not measure final annotation text: {err:#}"));
             }
-            self.editor
-                .add_text(text.area(), text.units(), self.editor.text_style)
+            self.interaction.add_text(text.area(), text.units())
         } else {
             None
         };
@@ -520,30 +466,22 @@ impl Session {
             }
             self.refresh(hwnd);
         } else {
-            // SAFETY: mouse capture is scoped to the overlay on its owning thread.
-            unsafe {
-                SetCapture(hwnd);
-                if GetCapture() == hwnd {
-                    self.text_resize = Some(grip.left - point.x);
-                }
+            if capture_mouse(hwnd) {
+                self.interaction.begin_text_resize(
+                    point.x,
+                    grip.left,
+                    self.bounds.left + input.left(),
+                );
             }
         }
         true
     }
 
-    fn drag_text_grip(&mut self) {
-        if let (Some(offset), Some(input)) = (self.text_resize, &mut self.text) {
-            let width = self.cursor.x - self.bounds.left + offset - input.left();
-            if let Err(err) = input.resize(Some(width)) {
-                crate::logging::warn(format!("could not resize annotation text: {err:#}"));
-            }
-        }
-    }
-
     fn style_option(&mut self, hwnd: HWND, button: ToolbarButton, point: Point) {
-        let mut text_style = self.editor.text_style;
-        let mut stroke_style = self.editor.stroke_style;
-        let editing_text = self.editor.tool == Some(Tool::Text);
+        let editor = self.interaction.editor();
+        let mut text_style = editor.text_style;
+        let mut stroke_style = editor.stroke_style;
+        let editing_text = editor.tool == Some(Tool::Text);
         match button {
             ToolbarButton::TextSize => match choose_size(hwnd, point, text_style.size_px) {
                 Ok(Some(size)) => text_style.size_px = size,
@@ -578,12 +516,11 @@ impl Session {
         if let Some(input) = &mut self.text {
             if let Err(err) = input.set_style(text_style) {
                 crate::logging::warn(format!("could not apply annotation text style: {err:#}"));
-                text_style = self.editor.text_style;
+                text_style = self.interaction.editor().text_style;
             }
             input.focus();
         }
-        self.editor.text_style = text_style;
-        self.editor.stroke_style = stroke_style;
+        self.interaction.set_styles(text_style, stroke_style);
         self.refresh(hwnd);
     }
 
@@ -597,66 +534,70 @@ impl Session {
         })
     }
 
-    fn press_canvas(&mut self, hwnd: HWND, point: Point) {
-        self.finish_text(hwnd, true);
-        self.cursor = point;
-        if self.editor.locks_selection() {
-            return self.begin_edit(hwnd, point);
+    fn press(&mut self, hwnd: HWND, msg: u32, wp: WPARAM, point: Point) {
+        if !self.interaction.idle() {
+            return;
         }
-        let hit = hit_test(&self.frames, self.selection.rect, point);
-        self.selection.begin(point, self.bounds, hit);
-        // SAFETY: acquire mouse capture on this UI thread.
-        unsafe {
-            SetCapture(hwnd);
-        }
-        self.refresh(hwnd);
-    }
-
-    /// Consume toolbar presses, including its padding, before selection hit testing.
-    fn press_toolbar(&mut self, hwnd: HWND, point: Point) -> bool {
-        let Some(toolbar) = self.scene.toolbar.filter(|bar| bar.rect.contains(point)) else {
-            return false;
+        let double_click = msg == WM_LBUTTONDBLCLK;
+        let change = if let Some(bar) = self.scene.toolbar.filter(|bar| bar.rect.contains(point)) {
+            // The toolbar consumes presses on its padding and disabled buttons.
+            self.interaction
+                .press_toolbar(point, bar.button_at(point), || capture_mouse(hwnd))
+        } else if self.press_text_grip(hwnd, point, double_click)
+            || self.forward_text_press(point, msg, wp)
+        {
+            return;
+        } else {
+            self.finish_text(hwnd, true);
+            self.interaction
+                .press_canvas(point, double_click, self.bounds, &self.frames, || {
+                    capture_mouse(hwnd)
+                })
         };
-        self.cursor = point;
-        if let Some(button) = toolbar.button_at(point) {
-            // SAFETY: capture mouse-up even if the cursor moves off the button.
-            unsafe {
-                SetCapture(hwnd);
-                if GetCapture() == hwnd {
-                    self.pressed_button = Some(button);
-                }
-            }
-        }
-        self.refresh(hwnd);
-        true
+        self.apply_change(hwnd, change);
     }
 
-    fn release_toolbar(&mut self, hwnd: HWND, point: Point) {
-        let pressed = self.pressed_button.take();
-        self.cursor = point;
-        let released = self.scene.toolbar.and_then(|bar| bar.button_at(point));
-        self.release_mouse(hwnd);
-        let clicked = pressed.filter(|button| Some(*button) == released);
-        if clicked.is_some_and(|button| !button.is_style_option()) {
+    fn click_toolbar(&mut self, hwnd: HWND, button: ToolbarButton) {
+        if !button.is_style_option() {
             self.finish_text(hwnd, true);
         }
-        match clicked {
-            Some(ToolbarButton::Copy) => self.confirm(OutputAction::Copy),
-            Some(ToolbarButton::Save) => self.confirm(OutputAction::SaveAs),
-            Some(ToolbarButton::Pin) => self.confirm(OutputAction::Pin),
-            Some(ToolbarButton::Undo) => self.history(hwnd, false),
-            Some(ToolbarButton::Redo) => self.history(hwnd, true),
-            Some(
-                button @ (ToolbarButton::TextSize
-                | ToolbarButton::StrokeWidth
-                | ToolbarButton::Color),
-            ) => self.style_option(hwnd, button, point),
-            Some(ToolbarButton::Tool(tool)) => {
-                self.editor.tool = (self.editor.tool != Some(tool)).then_some(tool);
-                self.refresh(hwnd);
+        let change = match button {
+            ToolbarButton::Copy => self.interaction.confirm(OutputAction::Copy),
+            ToolbarButton::Save => self.interaction.confirm(OutputAction::SaveAs),
+            ToolbarButton::Pin => self.interaction.confirm(OutputAction::Pin),
+            ToolbarButton::Undo => return self.history(hwnd, false),
+            ToolbarButton::Redo => return self.history(hwnd, true),
+            ToolbarButton::TextSize | ToolbarButton::StrokeWidth | ToolbarButton::Color => {
+                return self.style_option(hwnd, button, self.interaction.cursor());
             }
-            None => self.refresh(hwnd),
+            ToolbarButton::Tool(tool) => {
+                self.interaction.toggle_tool(tool);
+                Change::Refresh
+            }
+        };
+        self.apply_change(hwnd, change);
+    }
+
+    fn apply_change(&mut self, hwnd: HWND, change: Change) {
+        match change {
+            Change::None => return,
+            Change::Refresh => {}
+            Change::Annotation(damage) => self.invalidate_annotation(hwnd, damage),
+            Change::OpenText { selection, local } => self.open_text(hwnd, selection, local),
+            Change::ResizeText { width, focus } => {
+                if let Some(input) = &mut self.text {
+                    if let Err(err) = input.resize(Some(width)) {
+                        crate::logging::warn(format!("could not resize annotation text: {err:#}"));
+                    }
+                    if focus {
+                        input.focus();
+                    }
+                }
+            }
+            Change::ClickToolbar(button) => return self.click_toolbar(hwnd, button),
+            Change::Finish(outcome) => return self.finish(Ok(outcome)),
         }
+        self.refresh(hwnd);
     }
 
     fn message(&mut self, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
@@ -667,89 +608,28 @@ impl Session {
             WM_ERASEBKGND => return Some(LRESULT(1)),
             WM_MOUSEACTIVATE => return Some(LRESULT(MA_ACTIVATE as isize)),
             WM_PAINT => self.paint(hwnd),
-            WM_LBUTTONDOWN => {
-                let point = self.mouse_point(lp);
-                if !self.press_toolbar(hwnd, point)
-                    && !self.press_text_grip(hwnd, point, false)
-                    && !self.forward_text_press(point, msg, wp)
-                {
-                    self.press_canvas(hwnd, point);
-                }
+            WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
+                self.press(hwnd, msg, wp, self.mouse_point(lp));
             }
             WM_MOUSEMOVE => {
-                self.cursor = self.mouse_point(lp);
-                if self.text_resize.is_some() {
-                    self.drag_text_grip();
-                } else if self.editor.dragging() {
-                    if let Some(selection) = self.selection.saved_rect() {
-                        let damage = self.editor.update(local_point(self.cursor, selection));
-                        self.invalidate_annotation(hwnd, damage);
-                    }
-                } else {
-                    self.selection.update(self.cursor, self.bounds);
-                }
-                self.refresh(hwnd);
+                let change = self
+                    .interaction
+                    .move_pointer(self.mouse_point(lp), self.bounds);
+                self.apply_change(hwnd, change);
             }
-            WM_LBUTTONUP if self.pressed_button.is_some() => {
-                self.release_toolbar(hwnd, self.mouse_point(lp));
-            }
-            WM_LBUTTONUP if self.text_resize.is_some() => {
-                self.cursor = self.mouse_point(lp);
-                self.drag_text_grip();
-                self.text_resize = None;
+            WM_LBUTTONUP => {
+                let change = self.interaction.release_pointer(
+                    self.mouse_point(lp),
+                    self.bounds,
+                    &self.frames,
+                    &self.scene,
+                )?;
                 self.release_mouse(hwnd);
-                if let Some(input) = &self.text {
-                    input.focus();
-                }
-                self.refresh(hwnd);
-            }
-            WM_LBUTTONUP if self.editor.dragging() => {
-                self.cursor = self.mouse_point(lp);
-                if let Some(selection) = self.selection.saved_rect() {
-                    let damage = self.editor.finish(
-                        local_point(self.cursor, selection),
-                        selection,
-                        &self.frames,
-                    );
-                    self.invalidate_annotation(hwnd, damage);
-                }
-                self.release_mouse(hwnd);
-                self.refresh(hwnd);
-            }
-            WM_LBUTTONUP if self.selection.dragging() => {
-                self.cursor = self.mouse_point(lp);
-                self.selection.update(self.cursor, self.bounds);
-                let keep = self.selection.end();
-                // SAFETY: release capture after ending the drag.
-                unsafe {
-                    let _ = ReleaseCapture();
-                }
-                if keep {
-                    self.refresh(hwnd);
-                } else {
-                    self.finish(Ok(SelectionOutcome::Cancelled));
-                }
-            }
-            WM_LBUTTONDBLCLK => {
-                let cursor = self.mouse_point(lp);
-                if !self.press_toolbar(hwnd, cursor)
-                    && !self.press_text_grip(hwnd, cursor, true)
-                    && !self.forward_text_press(cursor, msg, wp)
-                {
-                    if self.editor.tool.is_some() {
-                        self.press_canvas(hwnd, cursor);
-                    } else if self
-                        .selection
-                        .rect
-                        .is_some_and(|rect| rect.contains(cursor))
-                    {
-                        self.confirm(self.default_action);
-                    }
-                }
+                self.apply_change(hwnd, change);
             }
             WM_SETCURSOR => {
-                let cursor = cursor_position().unwrap_or(self.cursor);
-                let system_cursor = if self.text_resize.is_some()
+                let cursor = cursor_position().unwrap_or(self.interaction.cursor());
+                let system_cursor = if self.interaction.resizing_text()
                     || self
                         .scene
                         .text_grip
@@ -771,11 +651,11 @@ impl Session {
                     ))
                 }) {
                     IDC_IBEAM
-                } else if self.editor.locks_selection() {
-                    if self.editor.tool.is_some()
+                } else if self.interaction.editor().locks_selection() {
+                    if self.interaction.editor().tool.is_some()
                         && self
-                            .selection
-                            .rect
+                            .interaction
+                            .selection()
                             .is_some_and(|rect| rect.contains(cursor))
                     {
                         IDC_CROSS
@@ -783,7 +663,7 @@ impl Session {
                         IDC_ARROW
                     }
                 } else {
-                    cursor_for(hit_test(&self.frames, self.selection.rect, cursor))
+                    cursor_for(hit_test(&self.frames, self.interaction.selection(), cursor))
                 };
                 // SAFETY: LoadCursorW loads a shared system cursor.
                 unsafe {
@@ -816,18 +696,13 @@ impl Session {
                 }
             }
             WM_RBUTTONDOWN | WM_DISPLAYCHANGE | WM_CLOSE | WM_CANCELMODE => {
-                self.finish(Ok(SelectionOutcome::Cancelled));
+                let change = self.interaction.cancel();
+                self.apply_change(hwnd, change);
             }
-            WM_CAPTURECHANGED if self.selection.dragging() => {
-                self.finish(Ok(SelectionOutcome::Cancelled))
+            WM_CAPTURECHANGED => {
+                let change = self.interaction.lose_capture()?;
+                self.apply_change(hwnd, change);
             }
-            WM_CAPTURECHANGED if self.editor.dragging() => {
-                let damage = self.editor.cancel_gesture();
-                self.invalidate_annotation(hwnd, damage);
-                self.refresh(hwnd);
-            }
-            WM_CAPTURECHANGED if self.text_resize.take().is_some() => self.refresh(hwnd),
-            WM_CAPTURECHANGED if self.pressed_button.take().is_some() => self.refresh(hwnd),
             WM_DPICHANGED => {
                 crate::logging::debug("overlay retained physical coordinates after WM_DPICHANGED")
             }
@@ -971,6 +846,14 @@ fn cursor_position() -> Option<Point> {
     // SAFETY: cursor points to writable stack storage.
     unsafe { GetCursorPos(&mut cursor) }.ok()?;
     Some(Point::new(cursor.x, cursor.y))
+}
+
+fn capture_mouse(hwnd: HWND) -> bool {
+    // SAFETY: the overlay requests capture on its owning UI thread.
+    unsafe {
+        SetCapture(hwnd);
+        GetCapture() == hwnd
+    }
 }
 
 fn cursor_for(hit: Hit) -> PCWSTR {

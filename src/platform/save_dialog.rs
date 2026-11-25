@@ -12,7 +12,7 @@ use windows::Win32::UI::Shell::{
     FOS_PATHMUSTEXIST, FileSaveDialog, IFileSaveDialog, IShellItem, SHCreateItemFromParsingName,
     SIGDN_FILESYSPATH,
 };
-use windows::core::{IUnknown, PCWSTR, PWSTR, w};
+use windows::core::{IUnknown, PCWSTR, PWSTR};
 
 use crate::output::ImageFormat;
 use crate::output::filename::wide;
@@ -21,9 +21,25 @@ pub fn choose_image(
     owner: HWND,
     folder: Option<&Path>,
     name: &str,
-    allow_jpeg: bool,
 ) -> anyhow::Result<Option<PathBuf>> {
     let name = wide(OsStr::new(name))?;
+    let default_suffix = ImageFormat::SUPPORTED[0].extensions()[0];
+    let default_extension = wide(OsStr::new(default_suffix))?;
+    let filter_strings = ImageFormat::SUPPORTED.map(|format| {
+        let extensions = format.extensions();
+        let label = format!("{} 图片 (*.{})", format.label(), extensions.join(", *."));
+        let pattern = format!("*.{}", extensions.join(";*."));
+        (
+            label.encode_utf16().chain([0]).collect::<Vec<_>>(),
+            pattern.encode_utf16().chain([0]).collect::<Vec<_>>(),
+        )
+    });
+    let filters = filter_strings
+        .each_ref()
+        .map(|(label, pattern)| COMDLG_FILTERSPEC {
+            pszName: PCWSTR(label.as_ptr()),
+            pszSpec: PCWSTR(pattern.as_ptr()),
+        });
     // SAFETY: the UI thread has initialized COM, the owner is live, and the
     // input strings remain null-terminated for the duration of these calls.
     unsafe {
@@ -36,19 +52,9 @@ pub fn choose_image(
                 | FOS_PATHMUSTEXIST
                 | FOS_NOCHANGEDIR,
         )?;
-        let formats = [
-            COMDLG_FILTERSPEC {
-                pszName: w!("PNG 图片 (*.png)"),
-                pszSpec: w!("*.png"),
-            },
-            COMDLG_FILTERSPEC {
-                pszName: w!("JPEG 图片 (*.jpg, *.jpeg)"),
-                pszSpec: w!("*.jpg;*.jpeg"),
-            },
-        ];
-        dialog.SetFileTypes(&formats[..if allow_jpeg { 2 } else { 1 }])?;
+        dialog.SetFileTypes(&filters)?;
         dialog.SetFileTypeIndex(1)?;
-        dialog.SetDefaultExtension(w!("png"))?;
+        dialog.SetDefaultExtension(PCWSTR(default_extension.as_ptr()))?;
         dialog.SetFileName(PCWSTR(name.as_ptr()))?;
         if let Some(folder) = folder {
             if let Err(err) = set_initial_folder(&dialog, folder) {
@@ -61,12 +67,10 @@ pub fn choose_image(
             Err(err) => return Err(err).context("showing the Save As dialog"),
         }
         let path = take_shell_path(dialog.GetResult()?.GetDisplayName(SIGDN_FILESYSPATH)?);
-        match ImageFormat::from_path(&path) {
-            Some(ImageFormat::Png) => {}
-            Some(ImageFormat::Jpeg) if allow_jpeg => {}
-            _ if allow_jpeg => anyhow::bail!("请选择 .png、.jpg 或 .jpeg 扩展名"),
-            _ => anyhow::bail!("请选择 .png 扩展名"),
-        }
+        anyhow::ensure!(
+            ImageFormat::from_path(&path).is_some(),
+            "请选择“保存类型”中支持的文件扩展名"
+        );
         Ok(Some(path))
     }
 }

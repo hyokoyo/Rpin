@@ -9,7 +9,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{Error, PCWSTR, w};
 
-use crate::pins::{PinId, PinSummary};
+use crate::app::Command;
+use crate::pins::PinSummary;
 
 use super::{menu::PopupMenu, window::hinstance};
 
@@ -36,20 +37,6 @@ pub struct TrayMenuState {
     pub pins: Vec<PinSummary>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TrayCommand {
-    Region,
-    Fullscreen,
-    FullscreenSave,
-    NewPin,
-    ShowPin(PinId),
-    ClosePins,
-    OpenConfig,
-    ReloadConfig,
-    ToggleAutostart,
-    Exit,
-}
-
 pub struct Tray {
     hwnd: HWND,
     icon: HICON,
@@ -57,6 +44,15 @@ pub struct Tray {
 }
 
 impl Tray {
+    #[cfg(test)]
+    pub(crate) fn inactive(hwnd: HWND) -> Self {
+        Self {
+            hwnd,
+            icon: HICON::default(),
+            added: false,
+        }
+    }
+
     pub fn new(hwnd: HWND) -> anyhow::Result<Self> {
         let icon = load_app_icon();
         let mut tray = Self {
@@ -133,7 +129,7 @@ impl Tray {
         }
     }
 
-    pub fn show_menu(hwnd: HWND, state: &TrayMenuState) -> Option<TrayCommand> {
+    pub fn show_menu(hwnd: HWND, state: &TrayMenuState) -> Option<Command> {
         let menu = match state.menu() {
             Ok(menu) => menu,
             Err(err) => {
@@ -146,19 +142,19 @@ impl Tray {
         // SAFETY: pt is valid output storage.
         let _ = unsafe { GetCursorPos(&mut pt) };
         match menu.track(hwnd, pt) {
-            MENU_REGION => Some(TrayCommand::Region),
-            MENU_FULLSCREEN => Some(TrayCommand::Fullscreen),
-            MENU_FULLSCREEN_SAVE => Some(TrayCommand::FullscreenSave),
-            MENU_NEW_PIN => Some(TrayCommand::NewPin),
-            MENU_CLOSE_PINS => Some(TrayCommand::ClosePins),
-            MENU_OPEN_CONFIG => Some(TrayCommand::OpenConfig),
-            MENU_RELOAD_CONFIG => Some(TrayCommand::ReloadConfig),
-            MENU_AUTOSTART => Some(TrayCommand::ToggleAutostart),
-            MENU_EXIT => Some(TrayCommand::Exit),
+            MENU_REGION => Some(Command::Region),
+            MENU_FULLSCREEN => Some(Command::Fullscreen),
+            MENU_FULLSCREEN_SAVE => Some(Command::FullscreenSave),
+            MENU_NEW_PIN => Some(Command::NewPin),
+            MENU_CLOSE_PINS => Some(Command::ClosePins),
+            MENU_OPEN_CONFIG => Some(Command::OpenConfig),
+            MENU_RELOAD_CONFIG => Some(Command::ReloadConfig),
+            MENU_AUTOSTART => Some(Command::ToggleAutostart),
+            MENU_EXIT => Some(Command::Exit),
             id => id
                 .checked_sub(MENU_PIN_BASE)
                 .and_then(|index| state.pins.get(index))
-                .map(|pin| TrayCommand::ShowPin(pin.id)),
+                .map(|pin| Command::ShowPin(pin.id)),
         }
     }
 

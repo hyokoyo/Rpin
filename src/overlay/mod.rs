@@ -1,5 +1,6 @@
 mod cache;
 mod input;
+mod interaction;
 mod render;
 mod scene;
 mod style;

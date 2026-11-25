@@ -10,7 +10,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{PCWSTR, w};
 
+use crate::app::Command;
+
 use super::window::MAIN_WINDOW_CLASS;
+
+const MAX_COMMAND_BYTES: u32 = 64;
 
 pub enum AcquireResult {
     Primary(SingleInstance),
@@ -97,18 +101,20 @@ fn send_copy_data(hwnd: HWND, command: &str) -> Option<bool> {
     (result.0 != 0).then_some(accepted != 0)
 }
 
-pub fn read_copy_data(lparam: LPARAM) -> Option<String> {
+/// The lparam must be from a live WM_COPYDATA callback.
+pub unsafe fn read_copy_data(lparam: LPARAM) -> Option<Command> {
     if lparam.0 == 0 {
         return None;
     }
     // SAFETY: WM_COPYDATA guarantees lparam points to a valid COPYDATASTRUCT
     // for the duration of the message handler.
     let data = unsafe { &*(lparam.0 as *const COPYDATASTRUCT) };
-    if data.dwData != 1 || data.cbData == 0 || data.lpData.is_null() {
+    if data.dwData != 1 || !(1..=MAX_COMMAND_BYTES).contains(&data.cbData) || data.lpData.is_null()
+    {
         return None;
     }
     // SAFETY: the sender guarantees cbData bytes at lpData.
     let bytes =
         unsafe { std::slice::from_raw_parts(data.lpData as *const u8, data.cbData as usize) };
-    String::from_utf8(bytes.to_vec()).ok()
+    Command::from_ipc(std::str::from_utf8(bytes).ok()?)
 }

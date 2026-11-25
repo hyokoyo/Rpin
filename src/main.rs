@@ -56,13 +56,14 @@ fn run() -> i32 {
             }
         };
     }
-    let command = command_from_args(args);
-    if command == "version" {
+    let Some(command) = command_from_args(args) else {
         println!("RPin {}", env!("CARGO_PKG_VERSION"));
         return 0;
-    }
+    };
     // Only the primary process creates/repairs configuration and opens the log.
-    let instance = match platform::single_instance::acquire(&command) {
+    let instance = match platform::single_instance::acquire(
+        command.ipc_name().expect("CLI commands have an IPC name"),
+    ) {
         Ok(platform::single_instance::AcquireResult::Primary(instance)) => instance,
         Ok(platform::single_instance::AcquireResult::Secondary) => return 0,
         Err(err) => {
@@ -95,7 +96,7 @@ fn run() -> i32 {
         }
     };
 
-    let mut app = match app::App::new(hwnd, config, Some(instance)) {
+    let app = match app::App::new(hwnd, config, Some(instance)) {
         Ok(app) => app,
         Err(err) => {
             logging::error(format!("failed to initialize app: {err}"));
@@ -107,24 +108,18 @@ fn run() -> i32 {
             return 1;
         }
     };
-    app.apply_startup_command(&command);
-    if app.exit_requested() {
-        logging::info("exit requested by command line");
-        // SAFETY: no messages have been dispatched yet; the App is still local.
-        unsafe {
-            let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(hwnd);
-        }
-        return 0;
+    let raw = Box::into_raw(Box::new(app::WindowState::new(app)));
+    // SAFETY: main owns raw until the window and message loop have finished.
+    unsafe {
+        platform::window::attach_app(hwnd, raw);
+        (*raw).run_startup(hwnd, command);
     }
-
-    let raw = Box::into_raw(Box::new(std::cell::RefCell::new(app)));
-    platform::window::attach_app(hwnd, raw);
 
     logging::info(format!("message loop ready pid={}", std::process::id()));
     let exit_code = platform::window::run_message_loop();
 
     // SAFETY: the message loop has ended. If the window still exists, detach
-    // the App pointer before destroying it, then reclaim the Box exactly once.
+    // the state pointer before destroying it, then reclaim the Box exactly once.
     unsafe {
         if IsWindow(Some(hwnd)).as_bool() {
             platform::window::detach_app(hwnd);
@@ -137,19 +132,21 @@ fn run() -> i32 {
     exit_code
 }
 
-fn command_from_args(args: impl Iterator<Item = std::ffi::OsString>) -> String {
+fn command_from_args(args: impl Iterator<Item = std::ffi::OsString>) -> Option<app::Command> {
     for arg in args {
-        match arg.to_str() {
-            Some("--capture-region") => return "capture-region".to_string(),
-            Some("--capture-fullscreen") => return "capture-fullscreen".to_string(),
-            Some("--capture-fullscreen-save") => return "capture-fullscreen-save".to_string(),
-            Some("--reload-config") => return "reload-config".to_string(),
-            Some("--exit") => return "exit".to_string(),
-            Some("--version" | "-V") => return "version".to_string(),
-            _ => {}
+        let Some(arg) = arg.to_str() else { continue };
+        if matches!(arg, "--version" | "-V") {
+            return None;
+        }
+        if let Some(command) = arg
+            .strip_prefix("--")
+            .and_then(app::Command::from_ipc)
+            .filter(|&command| command != app::Command::Show)
+        {
+            return Some(command);
         }
     }
-    "show".to_string()
+    Some(app::Command::Show)
 }
 
 fn install_panic_hook() {

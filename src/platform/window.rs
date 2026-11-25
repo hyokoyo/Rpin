@@ -87,9 +87,9 @@ pub fn run_message_loop() -> i32 {
     }
 }
 
-/// Binds the boxed `App` to the hidden window. Must be called after creation.
-pub fn attach_app(hwnd: HWND, app: *mut std::cell::RefCell<app::App>) {
-    // SAFETY: the pointer is valid until `detach_app` is called.
+/// The state must live until the window is destroyed or detached on this thread.
+pub(crate) unsafe fn attach_app(hwnd: HWND, app: *const app::WindowState) {
+    // SAFETY: the caller keeps the attached pointer alive for native callbacks.
     unsafe {
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, app as isize);
     }
