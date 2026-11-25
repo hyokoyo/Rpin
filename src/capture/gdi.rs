@@ -304,6 +304,35 @@ pub(crate) fn bgra_header(width: i32, height: i32) -> BITMAPINFO {
     }
 }
 
+/// Draw into a new top-down DIB on this thread.
+///
+/// # Safety
+/// A successful draw must initialize the entire frame before returning.
+pub(crate) unsafe fn render_to_frame(
+    bounds: Rect,
+    draw: impl FnOnce(HDC) -> anyhow::Result<()>,
+) -> anyhow::Result<Frame> {
+    let (width, height) = (bounds.width(), bounds.height());
+    let len = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|area| area.checked_mul(4))
+        .filter(|len| width > 0 && height > 0 && *len <= isize::MAX as usize)
+        .ok_or(CaptureError::InvalidDimensions { width, height })?;
+    let dc = MemoryDc::create(None)?;
+    let (bitmap, bits) = dib(dc.0, width, height)?;
+    let selected = Selection::new(&dc, &bitmap)?;
+    draw(dc.0)?;
+    // SAFETY: flush writes on the owning thread before transferring the pixels.
+    if !unsafe { GdiFlush() }.as_bool() {
+        return Err(CaptureError::win32("GdiFlush").into());
+    }
+    selected.restore()?;
+    // SAFETY: draw completed and this flushed DIB is no longer selected.
+    let pixels = unsafe { DibPixels::new(bitmap, bits, len) };
+    Frame::from_dib(width as u32, height as u32, pixels)
+        .ok_or_else(|| CaptureError::InvalidDimensions { width, height }.into())
+}
+
 pub(crate) fn dib(
     source: HDC,
     width: i32,

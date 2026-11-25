@@ -22,8 +22,8 @@ use crate::capture::{
 use crate::config::Config;
 use crate::logging::Level;
 use crate::output::png::Compression;
-use crate::output::png_writer::{SaveWorker, WM_SAVE_DONE};
-use crate::output::{OutputAction, OutputError, SelectionOutcome, crop, filename};
+use crate::output::save::{SaveWorker, WM_SAVE_DONE};
+use crate::output::{ImageFormat, OutputAction, OutputError, SelectionOutcome, crop, filename};
 use crate::overlay::{DIRECT2D_IDLE_TIMER, Direct2dCache, Overlay, WM_SELECTION_FINISHED};
 use crate::pins::NativePinManager;
 use crate::platform::hotkey::Hotkey;
@@ -283,18 +283,26 @@ impl App {
         let Some(result) = self.overlay.as_mut().and_then(Overlay::take_outcome) else {
             return;
         };
-        self.close_overlay();
-        match result {
-            Ok((SelectionOutcome::Confirmed { rect, action }, frames)) => {
+        self.overlay.take();
+        let result = result.and_then(|result| match result.outcome {
+            SelectionOutcome::Confirmed { rect, action } => {
                 crate::logging::info(format!("selection confirmed: {rect:?}, action={action:?}"));
-                match crop::compose(frames, rect) {
-                    Ok(frame) => {
-                        self.execute_output(frame, action, Point::new(rect.left, rect.top), started)
-                    }
-                    Err(err) => self.report_capture_error(err.into()),
-                }
+                let frame = crop::compose(result.frames, rect)?;
+                let frame = if result.annotations.is_empty() {
+                    frame
+                } else {
+                    let factory = self.direct2d.factory()?;
+                    crate::annotation::flatten(&factory, frame, &result.annotations)?
+                };
+                Ok(Some((frame, action, Point::new(rect.left, rect.top))))
             }
-            Ok((SelectionOutcome::Cancelled, _)) => crate::logging::debug("selection cancelled"),
+            SelectionOutcome::Cancelled => Ok(None),
+        });
+        self.direct2d
+            .start_idle(self.config.ui.direct2d_idle_seconds);
+        match result {
+            Ok(Some((frame, action, at))) => self.execute_output(frame, action, at, started),
+            Ok(None) => crate::logging::debug("selection cancelled"),
             Err(err) => self.report_capture_error(err),
         }
     }
@@ -338,7 +346,7 @@ impl App {
         let mut target = None;
         if explicit_save {
             // A cancelled dialog is silent and leaves the clipboard untouched.
-            match self.choose_output_path() {
+            match self.choose_output_path(action == OutputAction::SaveAs) {
                 Ok(Some(path)) => target = Some(path),
                 Ok(None) => return,
                 Err(err) => return self.report_save_error(err),
@@ -349,7 +357,7 @@ impl App {
         if !explicit_save && config.auto_save {
             // Copy is the primary action. Cancelling the optional save
             // dialog after copying leaves the clipboard image available.
-            match self.choose_output_path() {
+            match self.choose_output_path(false) {
                 Ok(path) => target = path,
                 Err(err) => return self.report_save_error(err),
             }
@@ -401,21 +409,25 @@ impl App {
         }
     }
 
-    fn choose_output_path(&self) -> anyhow::Result<Option<std::path::PathBuf>> {
+    fn choose_output_path(&self, allow_jpeg: bool) -> anyhow::Result<Option<std::path::PathBuf>> {
         let config = &self.config.capture;
         let directory = config.save_dir.trim();
         let directory = (!directory.is_empty()).then(|| std::path::Path::new(directory));
-        let name = format!("{}.png", filename::stem(&config.filename));
-        save_dialog::choose_png(self.hwnd, directory, &name)
+        let name = filename::stem(&config.filename);
+        save_dialog::choose_image(self.hwnd, directory, &name, allow_jpeg)
     }
 
     fn finish_save(&mut self) {
         let Some(result) = self.saver.take_result() else {
             return;
         };
-        log_memory("after PNG worker released frame", Level::Debug);
         match result {
             Ok(path) => {
+                let format = ImageFormat::from_path(&path).map_or("image", ImageFormat::label);
+                log_memory(
+                    &format!("after {format} worker released frame"),
+                    Level::Debug,
+                );
                 crate::logging::info(format!("saved {}", path.display()));
                 self.notify_capture("截图已保存", &path.to_string_lossy(), false);
             }

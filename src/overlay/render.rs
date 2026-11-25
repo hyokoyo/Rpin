@@ -20,10 +20,14 @@ use windows::Win32::Graphics::DirectWrite::{
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::core::{PCWSTR, w};
 
-use crate::capture::{CapturedMonitor, frame::Rect};
+use crate::annotation::{Editor, Painter, rgb_color};
+use crate::capture::{
+    CapturedMonitor,
+    frame::{Point, Rect},
+};
 use crate::config::UiConfig;
 
-use super::scene::{Label, Magnifier, Scene, Toolbar, handles, scaled};
+use super::scene::{Label, Magnifier, Scene, Toolbar, ToolbarButton, handles, scaled};
 
 thread_local! {
     static DWRITE: OnceCell<IDWriteFactory> = const { OnceCell::new() };
@@ -69,6 +73,7 @@ pub(super) struct Renderer {
     text: Vec<TextFormats>,
     bounds: Rect,
     retained: bool,
+    annotation: Option<Painter>,
 }
 
 struct TextFormats {
@@ -158,45 +163,71 @@ impl Renderer {
                 text,
                 bounds,
                 retained,
+                annotation: None,
             })
         }
     }
 
     pub(super) fn paint(
-        &self,
+        &mut self,
         dirty: Rect,
         frames: &[CapturedMonitor],
         scene: &Scene,
+        editing: Option<(&ID2D1Factory, &Editor)>,
     ) -> windows::core::Result<()> {
         let dirty = if self.retained { dirty } else { self.bounds };
         if dirty.is_empty() {
             return Ok(());
         }
+        let editing = editing.filter(|(_, editor)| editor.has_marks());
+        if let Some((factory, _)) = editing {
+            if self.annotation.is_none() {
+                self.annotation = Some(Painter::new(factory, &self.target)?);
+            }
+        }
         // SAFETY: paint is called on the owning UI thread with live target
         // resources. Each pushed clip is popped before EndDraw.
         unsafe {
+            let mut annotations = Ok(());
             self.target.BeginDraw();
             self.target
                 .PushAxisAlignedClip(&self.client(dirty), D2D1_ANTIALIAS_MODE_ALIASED);
             self.target.FillRectangle(&self.client(dirty), &self.black);
-            self.draw_desktop(frames, dirty);
-            self.target.FillRectangle(&self.client(dirty), &self.dim);
+            // Annotation gestures usually invalidate a small area inside the
+            // selection. In that case draw the undimmed desktop only once.
+            if !scene
+                .selection
+                .is_some_and(|rect| rect.intersect(dirty) == Some(dirty))
+            {
+                self.draw_desktop(frames, dirty);
+                self.target.FillRectangle(&self.client(dirty), &self.dim);
+            }
             if let Some(rect) = scene.selection {
                 if let Some(visible) = dirty.intersect(rect) {
                     self.target
                         .PushAxisAlignedClip(&self.client(visible), D2D1_ANTIALIAS_MODE_ALIASED);
                     self.draw_desktop(frames, visible);
+                    if let (Some(painter), Some((_, editor))) = (&self.annotation, editing) {
+                        annotations = painter.preview(
+                            &self.target,
+                            editor,
+                            Point::new(rect.left - self.bounds.left, rect.top - self.bounds.top),
+                            visible.offset(-rect.left, -rect.top),
+                        );
+                    }
                     self.target.PopAxisAlignedClip();
                 }
                 self.outline(rect);
-                for (_, _, handle) in handles(frames, rect) {
-                    self.target.FillRectangle(&self.client(handle), &self.white);
-                    self.target.DrawRectangle(
-                        &self.client(handle),
-                        &self.black,
-                        1.0,
-                        None::<&ID2D1StrokeStyle>,
-                    );
+                if !scene.editing {
+                    for (_, _, handle) in handles(frames, rect) {
+                        self.target.FillRectangle(&self.client(handle), &self.white);
+                        self.target.DrawRectangle(
+                            &self.client(handle),
+                            &self.black,
+                            1.0,
+                            None::<&ID2D1StrokeStyle>,
+                        );
+                    }
                 }
                 if let Some(label) = scene.label {
                     self.draw_label(label, &format!("{} × {}", rect.width(), rect.height()));
@@ -205,6 +236,24 @@ impl Renderer {
             if let Some(zoom) = scene.magnifier {
                 self.draw_magnifier(zoom, &frames[zoom.monitor]);
             }
+            if let Some(grip) = scene.text_grip {
+                let rect = self.client(grip);
+                self.target.FillRectangle(&rect, &self.black);
+                let center = (rect.left + rect.right) / 2.0;
+                if rect.bottom - rect.top > 6.0 {
+                    for x in [center - 1.5, center + 0.5] {
+                        self.target.FillRectangle(
+                            &D2D_RECT_F {
+                                left: x,
+                                top: rect.top + 3.0,
+                                right: x + 1.0,
+                                bottom: rect.bottom - 3.0,
+                            },
+                            &self.white,
+                        );
+                    }
+                }
+            }
             if let Some(toolbar) = scene
                 .toolbar
                 .filter(|bar| dirty.intersect(bar.rect).is_some())
@@ -212,7 +261,7 @@ impl Renderer {
                 self.draw_toolbar(toolbar);
             }
             self.target.PopAxisAlignedClip();
-            self.target.EndDraw(None, None)
+            self.target.EndDraw(None, None).and(annotations)
         }
     }
 
@@ -326,16 +375,84 @@ impl Renderer {
             self.target
                 .FillRoundedRectangle(&rounded(toolbar.rect), &self.black);
             for (button, rect) in toolbar.buttons() {
-                if toolbar.hovered == Some(button) {
-                    let brush = if toolbar.pressed == Some(button) {
+                let active = matches!(button, ToolbarButton::Tool(tool) if toolbar.state.active_tool == Some(tool));
+                if active || toolbar.hovered == Some(button) {
+                    let brush = if active || toolbar.state.pressed == Some(button) {
                         &self.button_pressed
                     } else {
                         &self.button_hover
                     };
                     self.target.FillRoundedRectangle(&rounded(rect), brush);
                 }
-                self.draw_text(button.label(), &formats.button, &self.client(rect));
+                let enabled = toolbar.enabled(button);
+                if !enabled {
+                    self.white.SetOpacity(0.42);
+                }
+                match button {
+                    ToolbarButton::TextSize => {
+                        let size = toolbar.state.text_style.size_px;
+                        let label = if toolbar.compact {
+                            size.to_string()
+                        } else {
+                            format!("{size} px")
+                        };
+                        self.draw_text(&label, &formats.button, &self.client(rect));
+                    }
+                    ToolbarButton::StrokeWidth => {
+                        let label = if toolbar.compact {
+                            toolbar.state.stroke_style.width.label()
+                        } else {
+                            match toolbar.state.stroke_style.width {
+                                crate::annotation::StrokeWidth::Thin => "线宽 细",
+                                crate::annotation::StrokeWidth::Medium => "线宽 中",
+                                crate::annotation::StrokeWidth::Thick => "线宽 粗",
+                            }
+                        };
+                        self.draw_text(label, &formats.button, &self.client(rect));
+                    }
+                    ToolbarButton::Color => {
+                        self.draw_color_option(toolbar, rect, &formats.button);
+                    }
+                    _ => self.draw_text(
+                        button.label(toolbar.compact),
+                        &formats.button,
+                        &self.client(rect),
+                    ),
+                }
+                if !enabled {
+                    self.white.SetOpacity(1.0);
+                }
             }
+        }
+    }
+
+    unsafe fn draw_color_option(&self, toolbar: Toolbar, rect: Rect, format: &IDWriteTextFormat) {
+        let size = scaled(9, toolbar.dpi)
+            .min(rect.width())
+            .min(rect.height())
+            .max(1);
+        let x = if toolbar.compact {
+            rect.left + (rect.width() - size) / 2
+        } else {
+            rect.right - size - scaled(4, toolbar.dpi)
+        };
+        let y = rect.top + (rect.height() - size) / 2;
+        let swatch = self.client(Rect::new(x, y, x + size, y + size));
+        // SAFETY: this is part of the toolbar draw. Restore the shared brush after filling.
+        unsafe {
+            if !toolbar.compact {
+                self.draw_text(
+                    "颜色",
+                    format,
+                    &self.client(Rect::new(rect.left, rect.top, x, rect.bottom)),
+                );
+            }
+            self.white
+                .SetColor(&rgb_color(toolbar.state.active_color()));
+            self.target.FillRectangle(&swatch, &self.white);
+            self.white.SetColor(&WHITE);
+            self.target
+                .DrawRectangle(&swatch, &self.white, 1.0, None::<&ID2D1StrokeStyle>);
         }
     }
 
@@ -463,7 +580,13 @@ mod tests {
         let ui = UiConfig::default();
         let mut selection = Selection::default();
         selection.rect = Some(Rect::new(-180, 10, 200, 84));
-        let scene = Scene::new(&frames, &ui, &selection, Point::new(-230, 225), None);
+        let scene = Scene::new(
+            &frames,
+            &ui,
+            &selection,
+            Point::new(-230, 225),
+            Default::default(),
+        );
         assert!(scene.label.is_some());
         assert!(scene.magnifier.is_some());
         assert!(scene.toolbar.is_some());
@@ -486,9 +609,9 @@ mod tests {
         };
         let paint = (|| {
             let mut cache = crate::overlay::Direct2dCache::new(hwnd);
-            let renderer = Renderer::new(&cache.factory()?, hwnd, bounds, &frames, &ui)?;
-            renderer.paint(bounds, &frames, &scene)?;
-            renderer.paint(Rect::new(0, 90, 220, 150), &frames, &scene)?;
+            let mut renderer = Renderer::new(&cache.factory()?, hwnd, bounds, &frames, &ui)?;
+            renderer.paint(bounds, &frames, &scene, None)?;
+            renderer.paint(Rect::new(0, 90, 220, 150), &frames, &scene, None)?;
             Ok(())
         })();
         // SAFETY: the render target has been dropped, and the test owns this HWND.

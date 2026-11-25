@@ -14,12 +14,14 @@ use windows::Win32::UI::Shell::{
 };
 use windows::core::{IUnknown, PCWSTR, PWSTR, w};
 
+use crate::output::ImageFormat;
 use crate::output::filename::wide;
 
-pub fn choose_png(
+pub fn choose_image(
     owner: HWND,
     folder: Option<&Path>,
     name: &str,
+    allow_jpeg: bool,
 ) -> anyhow::Result<Option<PathBuf>> {
     let name = wide(OsStr::new(name))?;
     // SAFETY: the UI thread has initialized COM, the owner is live, and the
@@ -34,10 +36,18 @@ pub fn choose_png(
                 | FOS_PATHMUSTEXIST
                 | FOS_NOCHANGEDIR,
         )?;
-        dialog.SetFileTypes(&[COMDLG_FILTERSPEC {
-            pszName: w!("PNG 图片 (*.png)"),
-            pszSpec: w!("*.png"),
-        }])?;
+        let formats = [
+            COMDLG_FILTERSPEC {
+                pszName: w!("PNG 图片 (*.png)"),
+                pszSpec: w!("*.png"),
+            },
+            COMDLG_FILTERSPEC {
+                pszName: w!("JPEG 图片 (*.jpg, *.jpeg)"),
+                pszSpec: w!("*.jpg;*.jpeg"),
+            },
+        ];
+        dialog.SetFileTypes(&formats[..if allow_jpeg { 2 } else { 1 }])?;
+        dialog.SetFileTypeIndex(1)?;
         dialog.SetDefaultExtension(w!("png"))?;
         dialog.SetFileName(PCWSTR(name.as_ptr()))?;
         if let Some(folder) = folder {
@@ -51,11 +61,12 @@ pub fn choose_png(
             Err(err) => return Err(err).context("showing the Save As dialog"),
         }
         let path = take_shell_path(dialog.GetResult()?.GetDisplayName(SIGDN_FILESYSPATH)?);
-        anyhow::ensure!(
-            path.extension()
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("png")),
-            "请选择 .png 扩展名"
-        );
+        match ImageFormat::from_path(&path) {
+            Some(ImageFormat::Png) => {}
+            Some(ImageFormat::Jpeg) if allow_jpeg => {}
+            _ if allow_jpeg => anyhow::bail!("请选择 .png、.jpg 或 .jpeg 扩展名"),
+            _ => anyhow::bail!("请选择 .png 扩展名"),
+        }
         Ok(Some(path))
     }
 }

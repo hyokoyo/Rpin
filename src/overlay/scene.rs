@@ -1,3 +1,4 @@
+use crate::annotation::{StrokeStyle, TextStyle, Tool};
 use crate::capture::{
     CapturedMonitor,
     frame::{Point, Rect},
@@ -23,31 +24,107 @@ pub(super) struct Magnifier {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ToolbarButton {
+    TextSize,
+    StrokeWidth,
+    Color,
+    Undo,
+    Redo,
+    Tool(Tool),
     Copy,
     Save,
     Pin,
 }
 
 impl ToolbarButton {
-    pub(super) fn label(self) -> &'static str {
+    pub(super) fn label(self, compact: bool) -> &'static str {
         match self {
+            Self::TextSize => "字号",
+            Self::StrokeWidth => "线宽",
+            Self::Color => "颜色",
+            Self::Undo => {
+                if compact {
+                    "↶"
+                } else {
+                    "撤销"
+                }
+            }
+            Self::Redo => {
+                if compact {
+                    "↷"
+                } else {
+                    "重做"
+                }
+            }
+            Self::Tool(tool) => {
+                if compact {
+                    tool.compact_label()
+                } else {
+                    tool.label()
+                }
+            }
             Self::Copy => "复制",
             Self::Save => "保存",
             Self::Pin => "贴图",
         }
     }
+
+    pub(super) fn is_style_option(self) -> bool {
+        matches!(self, Self::TextSize | Self::StrokeWidth | Self::Color)
+    }
 }
 
-// Insert future annotation controls before the output buttons.
-const TOOLBAR_BUTTONS: [ToolbarButton; 3] =
-    [ToolbarButton::Pin, ToolbarButton::Save, ToolbarButton::Copy];
+const TOOLBAR_BUTTONS: [ToolbarButton; 11] = [
+    ToolbarButton::Undo,
+    ToolbarButton::Redo,
+    ToolbarButton::Tool(Tool::Pen),
+    ToolbarButton::Tool(Tool::Arrow),
+    ToolbarButton::Tool(Tool::Rectangle),
+    ToolbarButton::Tool(Tool::Ellipse),
+    ToolbarButton::Tool(Tool::Text),
+    ToolbarButton::Tool(Tool::Mosaic),
+    ToolbarButton::Pin,
+    ToolbarButton::Save,
+    ToolbarButton::Copy,
+];
+const TEXT_OPTIONS: [ToolbarButton; 2] = [ToolbarButton::TextSize, ToolbarButton::Color];
+const STROKE_OPTIONS: [ToolbarButton; 2] = [ToolbarButton::StrokeWidth, ToolbarButton::Color];
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct ToolbarState {
+    pub pressed: Option<ToolbarButton>,
+    pub active_tool: Option<Tool>,
+    pub can_undo: bool,
+    pub can_redo: bool,
+    pub editing: bool,
+    pub text_style: TextStyle,
+    pub stroke_style: StrokeStyle,
+}
+
+impl ToolbarState {
+    fn options(self) -> &'static [ToolbarButton] {
+        match self.active_tool {
+            Some(Tool::Text) => &TEXT_OPTIONS,
+            Some(tool) if tool.uses_stroke() => &STROKE_OPTIONS,
+            _ => &[],
+        }
+    }
+
+    pub(super) fn active_color(self) -> [u8; 3] {
+        if self.active_tool == Some(Tool::Text) {
+            self.text_style.rgb
+        } else {
+            self.stroke_style.rgb
+        }
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) struct Toolbar {
     pub rect: Rect,
     pub dpi: u32,
     pub hovered: Option<ToolbarButton>,
-    pub pressed: Option<ToolbarButton>,
+    pub state: ToolbarState,
+    pub compact: bool,
     padding: i32,
 }
 
@@ -56,7 +133,7 @@ impl Toolbar {
         frames: &[CapturedMonitor],
         selection: Rect,
         cursor: Point,
-        pressed: Option<ToolbarButton>,
+        state: ToolbarState,
     ) -> Option<Self> {
         let corner = Point::new(selection.right - 1, selection.bottom - 1);
         // In a gap between monitors, prefer the closest screen intersecting
@@ -72,9 +149,16 @@ impl Toolbar {
         })?;
         let bounds = monitor.info.rect;
         let dpi = monitor.info.dpi;
-        let count = TOOLBAR_BUTTONS.len() as i32;
+        let count = (state.options().len() + TOOLBAR_BUTTONS.len()) as i32;
         let padding = scaled(4, dpi).min((bounds.width() - count).max(0) / 2);
-        let width = (scaled(54, dpi) * count + padding * 2).min(bounds.width());
+        let full_width = scaled(54, dpi) * count + padding * 2;
+        let compact = full_width > bounds.width();
+        let width = if compact {
+            scaled(34, dpi) * count + padding * 2
+        } else {
+            full_width
+        };
+        let width = width.min(bounds.width());
         let height = scaled(34, dpi).min(bounds.height());
         if width < count || height < 1 {
             return None;
@@ -85,10 +169,10 @@ impl Toolbar {
         let above = selection.top - gap - height;
         let y = if below >= bounds.top && below + height <= bounds.bottom {
             below
-        } else if inside >= selection.top.max(bounds.top) {
-            inside
-        } else {
+        } else if above >= bounds.top {
             above
+        } else {
+            inside.max(bounds.top)
         };
         let rect = fit(
             Point::new(selection.right - width, y),
@@ -100,7 +184,8 @@ impl Toolbar {
             rect,
             dpi,
             hovered: None,
-            pressed,
+            state,
+            compact,
             padding,
         };
         toolbar.hovered = toolbar.button_at(cursor);
@@ -111,9 +196,12 @@ impl Toolbar {
         let vertical = self.padding.min((self.rect.height() - 1) / 2);
         let left = self.rect.left + self.padding;
         let inner_width = self.rect.width() - 2 * self.padding;
-        let count = TOOLBAR_BUTTONS.len() as i32;
-        TOOLBAR_BUTTONS
-            .into_iter()
+        let options = self.state.options();
+        let count = (options.len() + TOOLBAR_BUTTONS.len()) as i32;
+        options
+            .iter()
+            .chain(TOOLBAR_BUTTONS.iter())
+            .copied()
             .enumerate()
             .map(move |(index, button)| {
                 let index = index as i32;
@@ -131,6 +219,15 @@ impl Toolbar {
         self.buttons()
             .find(|(_, area)| area.contains(cursor))
             .map(|(button, _)| button)
+            .filter(|&button| self.enabled(button))
+    }
+
+    pub(super) fn enabled(self, button: ToolbarButton) -> bool {
+        match button {
+            ToolbarButton::Undo => self.state.can_undo,
+            ToolbarButton::Redo => self.state.can_redo,
+            _ => true,
+        }
     }
 }
 
@@ -140,6 +237,8 @@ pub(super) struct Scene {
     pub label: Option<Label>,
     pub magnifier: Option<Magnifier>,
     pub toolbar: Option<Toolbar>,
+    pub editing: bool,
+    pub text_grip: Option<Rect>,
 }
 
 impl Scene {
@@ -148,37 +247,39 @@ impl Scene {
         ui: &UiConfig,
         selection: &Selection,
         cursor: Point,
-        pressed: Option<ToolbarButton>,
+        controls: ToolbarState,
     ) -> Self {
         let toolbar = if selection.dragging() {
             None
         } else {
             selection
                 .saved_rect()
-                .and_then(|rect| Toolbar::new(frames, rect, cursor, pressed))
+                .and_then(|rect| Toolbar::new(frames, rect, cursor, controls))
         };
         let selection = selection.rect;
-        let label = selection.filter(|_| ui.show_size).and_then(|rect| {
-            let monitor = monitor_for_rect(frames, rect)?;
-            let bounds = monitor.info.rect;
-            let dpi = monitor.info.dpi;
-            let top = rect.top - scaled(26, dpi);
-            let y = if top >= bounds.top {
-                top
-            } else {
-                rect.top + scaled(8, dpi)
-            };
-            Some(Label {
-                rect: fit(
-                    Point::new(rect.left, y),
-                    scaled(140, dpi),
-                    scaled(22, dpi),
-                    bounds,
-                ),
-                dpi,
-            })
-        });
-        let magnifier = if ui.magnifier && pressed.is_none() {
+        let label = selection
+            .filter(|_| ui.show_size && !controls.editing)
+            .and_then(|rect| {
+                let monitor = monitor_for_rect(frames, rect)?;
+                let bounds = monitor.info.rect;
+                let dpi = monitor.info.dpi;
+                let top = rect.top - scaled(26, dpi);
+                let y = if top >= bounds.top {
+                    top
+                } else {
+                    rect.top + scaled(8, dpi)
+                };
+                Some(Label {
+                    rect: fit(
+                        Point::new(rect.left, y),
+                        scaled(140, dpi),
+                        scaled(22, dpi),
+                        bounds,
+                    ),
+                    dpi,
+                })
+            });
+        let magnifier = if ui.magnifier && controls.pressed.is_none() && !controls.editing {
             magnifier(frames, ui, cursor).filter(|zoom| {
                 !toolbar.is_some_and(|bar| {
                     bar.rect.contains(cursor) || bar.rect.intersect(zoom.area()).is_some()
@@ -192,14 +293,18 @@ impl Scene {
             label,
             magnifier,
             toolbar,
+            editing: controls.editing,
+            text_grip: None,
         }
     }
 
     pub(super) fn damage_from(&self, previous: &Self, frames: &[CapturedMonitor]) -> Option<Rect> {
-        let selection_changed =
-            self.selection != previous.selection || self.label != previous.label;
+        let selection_changed = self.selection != previous.selection
+            || self.label != previous.label
+            || self.editing != previous.editing;
         let magnifier_changed = self.magnifier != previous.magnifier;
         let toolbar_changed = self.toolbar != previous.toolbar;
+        let grip_changed = self.text_grip != previous.text_grip;
         [self, previous]
             .into_iter()
             .flat_map(|scene| {
@@ -222,7 +327,10 @@ impl Scene {
                     .toolbar
                     .filter(|_| toolbar_changed)
                     .map(|bar| bar.rect);
-                [selection, label, magnifier, toolbar].into_iter().flatten()
+                let grip = scene.text_grip.filter(|_| grip_changed);
+                [selection, label, magnifier, toolbar, grip]
+                    .into_iter()
+                    .flatten()
             })
             .reduce(|a, b| a.union(b))
     }
@@ -392,12 +500,21 @@ mod tests {
             monitor(right, 144),
         ];
         let selection = Rect::new(-200, 500, 140, 1080);
-        let bar = Toolbar::new(&frames, selection, Point::default(), None).expect("toolbar");
+        let bar = Toolbar::new(
+            &frames,
+            selection,
+            Point::default(),
+            ToolbarState::default(),
+        )
+        .expect("toolbar");
         assert_eq!(bar.dpi, 144);
         assert_eq!(bar.rect.intersect(right), Some(bar.rect));
         assert!(bar.rect.bottom < selection.bottom);
         for (button, area) in bar.buttons() {
-            assert_eq!(bar.button_at(Point::new(area.left, area.top)), Some(button));
+            assert_eq!(
+                bar.button_at(Point::new(area.left, area.top)),
+                bar.enabled(button).then_some(button)
+            );
         }
     }
 
@@ -411,20 +528,112 @@ mod tests {
         };
         let mut selection = Selection::default();
         selection.rect = Some(Rect::new(-600, -400, -300, -200));
-        let first = Scene::new(&frames, &ui, &selection, Point::default(), None);
+        let first = Scene::new(
+            &frames,
+            &ui,
+            &selection,
+            Point::default(),
+            ToolbarState::default(),
+        );
         let bar = first.toolbar.expect("toolbar");
         let (_, copy) = bar
             .buttons()
             .find(|(button, _)| *button == ToolbarButton::Copy)
             .expect("copy button");
         let cursor = Point::new(copy.left, copy.top);
-        let hovered = Scene::new(&frames, &ui, &selection, cursor, Some(ToolbarButton::Copy));
+        let hovered = Scene::new(
+            &frames,
+            &ui,
+            &selection,
+            cursor,
+            ToolbarState {
+                pressed: Some(ToolbarButton::Copy),
+                ..Default::default()
+            },
+        );
         assert_eq!(hovered.damage_from(&first, &frames), Some(bar.rect));
 
         let inside = Point::new(-400, -300);
         selection.begin(inside, bounds, Hit::Inside);
-        let dragging = Scene::new(&frames, &ui, &selection, inside, None);
+        let dragging = Scene::new(&frames, &ui, &selection, inside, ToolbarState::default());
         assert!(dragging.toolbar.is_none());
         assert_eq!(dragging.damage_from(&hovered, &frames), Some(bar.rect));
+    }
+
+    #[test]
+    fn compact_editor_tools_stay_left_of_pin_save_and_copy() {
+        let bounds = Rect::new(-500, -480, 0, 0);
+        let frames = [monitor(bounds, 192)];
+        let rect = Rect::new(-220, -200, -20, -20);
+        let bar = Toolbar::new(&frames, rect, Point::default(), ToolbarState::default()).unwrap();
+        assert!(bar.compact);
+        assert_eq!(bar.rect.intersect(bounds), Some(bar.rect));
+        let controls: Vec<_> = bar.buttons().map(|(button, _)| button).collect();
+        assert_eq!(
+            &controls[2..],
+            &[
+                ToolbarButton::Tool(Tool::Pen),
+                ToolbarButton::Tool(Tool::Arrow),
+                ToolbarButton::Tool(Tool::Rectangle),
+                ToolbarButton::Tool(Tool::Ellipse),
+                ToolbarButton::Tool(Tool::Text),
+                ToolbarButton::Tool(Tool::Mosaic),
+                ToolbarButton::Pin,
+                ToolbarButton::Save,
+                ToolbarButton::Copy,
+            ]
+        );
+    }
+
+    #[test]
+    fn tool_style_controls_match_the_selected_tool() {
+        let frames = [monitor(Rect::new(0, 0, 550, 480), 144)];
+        let rect = Rect::new(10, 20, 500, 100);
+        let plain = Toolbar::new(&frames, rect, Point::default(), ToolbarState::default()).unwrap();
+        let text = Toolbar::new(
+            &frames,
+            rect,
+            Point::default(),
+            ToolbarState {
+                active_tool: Some(Tool::Text),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let buttons = |toolbar: Toolbar| {
+            toolbar
+                .buttons()
+                .map(|(button, _)| button)
+                .collect::<Vec<_>>()
+        };
+        let text_buttons = buttons(text);
+        assert_eq!(
+            &text_buttons[..2],
+            &[ToolbarButton::TextSize, ToolbarButton::Color]
+        );
+        assert_eq!(&text_buttons[2..], buttons(plain));
+        for tool in [
+            Tool::Pen,
+            Tool::Arrow,
+            Tool::Rectangle,
+            Tool::Ellipse,
+            Tool::Mosaic,
+        ] {
+            let state = ToolbarState {
+                active_tool: Some(tool),
+                ..Default::default()
+            };
+            let bar = Toolbar::new(&frames, rect, Point::default(), state).unwrap();
+            let tool_buttons = buttons(bar);
+            if tool == Tool::Mosaic {
+                assert_eq!(tool_buttons, buttons(plain));
+            } else {
+                assert_eq!(
+                    &tool_buttons[..2],
+                    &[ToolbarButton::StrokeWidth, ToolbarButton::Color]
+                );
+                assert_eq!(&tool_buttons[2..], buttons(plain));
+            }
+        }
     }
 }

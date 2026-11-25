@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, WPARAM};
 use windows::Win32::Storage::FileSystem::{
-    DELETE, FILE_DISPOSITION_INFO, FILE_GENERIC_WRITE, FileDispositionInfo,
+    DELETE, FILE_DISPOSITION_INFO, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FileDispositionInfo,
     MOVEFILE_REPLACE_EXISTING, MoveFileExW, SetFileInformationByHandle,
 };
 use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
@@ -19,9 +19,10 @@ use crate::capture::frame::Frame;
 
 use super::filename::wide;
 use super::png::{Compression, write_rgb_with_compression};
+use super::{ImageFormat, jpeg};
 
 pub const WM_SAVE_DONE: u32 = WM_APP + 4;
-pub const THREAD_NAME: &str = "rpin-png";
+pub const THREAD_NAME: &str = "rpin-save";
 static NEXT_TEMP: AtomicU32 = AtomicU32::new(0);
 
 #[derive(Default)]
@@ -41,18 +42,21 @@ impl SaveWorker {
         path: PathBuf,
         compression: Compression,
     ) -> anyhow::Result<()> {
-        anyhow::ensure!(!self.busy(), "PNG worker is busy");
+        anyhow::ensure!(!self.busy(), "image save worker is busy");
+        let format = ImageFormat::from_path(&path).context("unsupported image extension")?;
         let (sender, receiver) = mpsc::channel();
         let owner = owner.0 as isize;
         std::thread::Builder::new()
             .name(THREAD_NAME.into())
             .spawn(move || {
                 let start = Instant::now();
-                let result = std::panic::catch_unwind(|| save_png(&frame, path, compression))
-                    .unwrap_or_else(|_| Err(anyhow::anyhow!("PNG worker panicked")));
+                let result =
+                    std::panic::catch_unwind(|| save_image(&frame, path, format, compression))
+                        .unwrap_or_else(|_| Err(anyhow::anyhow!("image save worker panicked")));
                 drop(frame);
                 crate::logging::debug(format!(
-                    "PNG worker finished in {:.2} ms",
+                    "{} worker finished in {:.2} ms",
+                    format.label(),
                     start.elapsed().as_secs_f64() * 1000.0
                 ));
                 if sender.send(result).is_ok() {
@@ -62,7 +66,7 @@ impl SaveWorker {
                     };
                 }
             })
-            .context("starting PNG worker")?;
+            .context("starting image save worker")?;
         self.pending = Some(receiver);
         Ok(())
     }
@@ -71,7 +75,9 @@ impl SaveWorker {
         let result = match self.pending.as_ref()?.try_recv() {
             Ok(result) => result,
             Err(TryRecvError::Empty) => return None,
-            Err(TryRecvError::Disconnected) => Err(anyhow::anyhow!("PNG worker disconnected")),
+            Err(TryRecvError::Disconnected) => {
+                Err(anyhow::anyhow!("image save worker disconnected"))
+            }
         };
         self.pending = None;
         Some(result)
@@ -82,26 +88,41 @@ impl SaveWorker {
             match receiver.recv_timeout(Duration::from_secs(2)) {
                 Ok(Ok(path)) => crate::logging::info(format!("saved {}", path.display())),
                 Ok(Err(err)) => crate::logging::error(format!("save failed: {err:#}")),
-                Err(err) => crate::logging::warn(format!("PNG worker during shutdown: {err}")),
+                Err(err) => {
+                    crate::logging::warn(format!("image save worker during shutdown: {err}"))
+                }
             }
         }
     }
 }
 
-fn save_png(frame: &Frame, path: PathBuf, compression: Compression) -> anyhow::Result<PathBuf> {
+fn save_image(
+    frame: &Frame,
+    path: PathBuf,
+    format: ImageFormat,
+    compression: Compression,
+) -> anyhow::Result<PathBuf> {
     let folder = path.parent().context("save path has no directory")?;
     let folder = fs::canonicalize(folder).context("resolving output directory")?;
     let destination = folder.join(path.file_name().context("save path has no file name")?);
     let (mut temp, file) = TemporaryFile::create(&folder)?;
-    let mut writer = BufWriter::new(file);
-    write_rgb_with_compression(frame, &mut writer, compression).context("encoding PNG")?;
+    let file = match format {
+        ImageFormat::Png => {
+            let mut writer = BufWriter::new(file);
+            write_rgb_with_compression(frame, &mut writer, compression).context("encoding PNG")?;
+            writer.into_inner().context("flushing PNG")?
+        }
+        ImageFormat::Jpeg => {
+            jpeg::write(frame, &file).context("encoding JPEG")?;
+            file
+        }
+    };
     // Flush before publishing the file so buffered I/O errors reach the caller.
     let source = wide(temp.path.as_os_str())?;
     let target = wide(destination.as_os_str())?;
-    let file = writer.into_inner().context("flushing PNG")?;
     // Keep automatic deletion enabled while encoding and preparing the paths.
     if temp.delete_on_close {
-        set_delete_on_close(&file, false).context("retaining the completed PNG")?;
+        set_delete_on_close(&file, false).context("retaining the completed image")?;
     }
     drop(file);
     // SAFETY: both paths are null-terminated. The save dialog has handled
@@ -132,7 +153,7 @@ impl TemporaryFile {
             match fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
-                .access_mode(FILE_GENERIC_WRITE.0 | DELETE.0)
+                .access_mode(FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0 | DELETE.0)
                 .open(&path)
             {
                 Ok(file) => {
@@ -140,7 +161,7 @@ impl TemporaryFile {
                         Ok(()) => true,
                         Err(err) => {
                             crate::logging::debug(format!(
-                                "automatic PNG temp cleanup unavailable: {err}"
+                                "automatic image temp cleanup unavailable: {err}"
                             ));
                             false
                         }
@@ -160,7 +181,7 @@ impl TemporaryFile {
                 }
             }
         }
-        anyhow::bail!("could not reserve a temporary PNG file")
+        anyhow::bail!("could not reserve a temporary image file")
     }
 }
 
@@ -170,7 +191,7 @@ impl Drop for TemporaryFile {
             if let Err(err) = fs::remove_file(&self.path) {
                 if err.kind() != ErrorKind::NotFound {
                     crate::logging::warn(format!(
-                        "could not clean PNG temp {}: {err}",
+                        "could not clean image temp {}: {err}",
                         self.path.display()
                     ));
                 }
@@ -240,12 +261,73 @@ mod tests {
         let path = folder.0.join("截图.png");
         fs::write(&path, b"old file")?;
         let frame = Frame::new(1, 1, vec![7, 2, 3, 0]).unwrap();
-        let saved = save_png(&frame, path.clone(), Compression::Small)?;
+        let saved = save_image(&frame, path.clone(), ImageFormat::Png, Compression::Small)?;
         assert_eq!(saved, path);
         let mut reader = ::png::Decoder::new(std::io::Cursor::new(fs::read(&path)?)).read_info()?;
         let mut pixel = [0; 3];
         reader.next_frame(&mut pixel)?;
         assert_eq!(pixel, [3, 2, 7]);
+        assert_eq!(fs::read_dir(&folder.0)?.count(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn jpeg_is_published_and_decodes_with_the_original_dimensions() -> anyhow::Result<()> {
+        use windows::Win32::Foundation::GENERIC_READ;
+        use windows::Win32::Graphics::Imaging::{
+            CLSID_WICImagingFactory, IWICImagingFactory, WICDecodeMetadataCacheOnDemand,
+        };
+        use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
+        use windows::core::IUnknown;
+
+        let folder = TestFolder::new()?;
+        let path = folder.0.join("标注.JPEG");
+        let format = ImageFormat::from_path(&path).expect("JPEG extension");
+        let frame = Frame::new(64, 17, [30, 80, 180, 255].repeat(64 * 17)).unwrap();
+        assert_eq!(
+            save_image(&frame, path.clone(), format, Compression::Fast)?,
+            path
+        );
+        let data = fs::read(&path)?;
+        assert!(data.starts_with(&[0xff, 0xd8]));
+        assert!(data.ends_with(&[0xff, 0xd9]));
+        let _com = crate::platform::com::ComGuard::init();
+        let name = wide(path.as_os_str())?;
+        let (mut width, mut height) = (0, 0);
+        // SAFETY: COM is initialized and the filename and output values are live.
+        unsafe {
+            let factory: IWICImagingFactory = CoCreateInstance(
+                &CLSID_WICImagingFactory,
+                None::<&IUnknown>,
+                CLSCTX_INPROC_SERVER,
+            )?;
+            let decoder = factory.CreateDecoderFromFilename(
+                PCWSTR(name.as_ptr()),
+                None,
+                GENERIC_READ,
+                WICDecodeMetadataCacheOnDemand,
+            )?;
+            let decoded = decoder.GetFrame(0)?;
+            decoded.GetSize(&mut width, &mut height)?;
+            let mut pixel = [0; 3];
+            decoded.CopyPixels(
+                &windows::Win32::Graphics::Imaging::WICRect {
+                    X: 0,
+                    Y: 0,
+                    Width: 1,
+                    Height: 1,
+                },
+                3,
+                &mut pixel,
+            )?;
+            assert!(
+                pixel
+                    .iter()
+                    .zip([30, 80, 180])
+                    .all(|(actual, expected)| actual.abs_diff(expected) <= 5)
+            );
+        }
+        assert_eq!((width, height), (64, 17));
         assert_eq!(fs::read_dir(&folder.0)?.count(), 1);
         Ok(())
     }
@@ -260,7 +342,8 @@ mod tests {
             .share_mode(FILE_SHARE_READ.0)
             .open(&path)?;
         let frame = Frame::new(1, 1, vec![7, 2, 3, 0]).unwrap();
-        let err = save_png(&frame, path.clone(), Compression::Fast).unwrap_err();
+        let err =
+            save_image(&frame, path.clone(), ImageFormat::Png, Compression::Fast).unwrap_err();
         assert!(err.to_string().starts_with("publishing "));
         assert_eq!(fs::read(path)?, b"old file");
         assert_eq!(fs::read_dir(&folder.0)?.count(), 1);

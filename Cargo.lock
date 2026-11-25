@@ -172,7 +172,7 @@ dependencies = [
 
 [[package]]
 name = "rpin"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "embed-resource",
@@ -181,6 +181,8 @@ dependencies = [
  "thiserror",
  "toml",
  "windows",
+ "windows-core",
+ "windows-numerics",
 ]
 
 [[package]]

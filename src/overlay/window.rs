@@ -4,27 +4,29 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{
-    D2DERR_RECREATE_TARGET, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
+    COLORREF, D2DERR_RECREATE_TARGET, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
 };
 use windows::Win32::Graphics::Direct2D::ID2D1Factory;
-use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, InvalidateRect, PAINTSTRUCT};
+use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, HDC, InvalidateRect, PAINTSTRUCT};
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetCapture, GetKeyState, ReleaseCapture, SetCapture, SetFocus, VIRTUAL_KEY, VK_CONTROL,
-    VK_DOWN, VK_ESCAPE, VK_LEFT, VK_RETURN, VK_RIGHT, VK_S, VK_SHIFT, VK_T, VK_UP,
+    VK_DOWN, VK_ESCAPE, VK_LEFT, VK_RETURN, VK_RIGHT, VK_S, VK_SHIFT, VK_T, VK_UP, VK_Y, VK_Z,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_DBLCLKS, CreateWindowExW, DestroyWindow, GWLP_USERDATA, GetCursorPos, GetForegroundWindow,
-    GetWindowLongPtrW, GetWindowThreadProcessId, IDC_ARROW, IDC_CROSS, IDC_HAND, IDC_SIZEALL,
-    IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, KillTimer, LoadCursorW, MA_ACTIVATE,
-    PostMessageW, RegisterClassW, SW_SHOWNOACTIVATE, SetCursor, SetForegroundWindow, SetTimer,
-    SetWindowLongPtrW, ShowWindow, WM_ACTIVATE, WM_APP, WM_CANCELMODE, WM_CAPTURECHANGED, WM_CLOSE,
-    WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_NCDESTROY, WM_PAINT, WM_RBUTTONDOWN,
-    WM_SETCURSOR, WM_TIMER, WNDCLASSW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    GetWindowLongPtrW, GetWindowThreadProcessId, IDC_ARROW, IDC_CROSS, IDC_HAND, IDC_IBEAM,
+    IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, IsWindow, KillTimer,
+    LoadCursorW, MA_ACTIVATE, PostMessageW, RegisterClassW, SW_SHOWNOACTIVATE, SetCursor,
+    SetForegroundWindow, SetTimer, SetWindowLongPtrW, ShowWindow, WM_ACTIVATE, WM_APP,
+    WM_CANCELMODE, WM_CAPTURECHANGED, WM_CLOSE, WM_COMMAND, WM_CTLCOLOREDIT, WM_DISPLAYCHANGE,
+    WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_NCDESTROY, WM_PAINT, WM_RBUTTONDOWN, WM_SETCURSOR, WM_TIMER,
+    WNDCLASSW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::core::{PCWSTR, w};
 
+use crate::annotation::{Document, Editor, Tool, local_point};
 use crate::capture::{
     CapturedMonitor,
     frame::{Point, Rect},
@@ -35,7 +37,9 @@ use crate::platform::window::{default_proc, hinstance};
 
 use super::input::{Handle, Hit, Selection};
 use super::render::Renderer;
-use super::scene::{Scene, ToolbarButton, hit_test};
+use super::scene::{Scene, ToolbarButton, ToolbarState, hit_test};
+use super::style::{choose_color, choose_size, choose_width};
+use super::text::{EN_CHANGE, TextInput, WM_TEXT_CHANGED, WM_TEXT_FINISHED, edit_colors};
 
 pub const WM_SELECTION_FINISHED: u32 = WM_APP + 3;
 const CLASS: PCWSTR = w!("RPin.SelectionOverlay");
@@ -51,12 +55,22 @@ pub struct Overlay {
     session: Rc<RefCell<Session>>,
 }
 
+pub(crate) struct SelectionResult {
+    pub outcome: SelectionOutcome,
+    pub frames: Vec<CapturedMonitor>,
+    pub annotations: Document,
+}
+
 struct Session {
     owner: HWND,
     frames: Vec<CapturedMonitor>,
     bounds: Rect,
     ui: UiConfig,
     selection: Selection,
+    editor: Editor,
+    text: Option<TextInput>,
+    text_resize: Option<i32>,
+    custom_colors: [COLORREF; 16],
     default_action: OutputAction,
     pressed_button: Option<ToolbarButton>,
     cursor: Point,
@@ -93,7 +107,7 @@ impl Overlay {
         );
         let cursor = cursor_position().unwrap_or(Point::new(bounds.left, bounds.top));
         let selection = Selection::default();
-        let scene = Scene::new(&frames, &ui, &selection, cursor, None);
+        let scene = Scene::new(&frames, &ui, &selection, cursor, ToolbarState::default());
         let instance = register_class()?;
         // SAFETY: the class is registered and the top-level window uses
         // virtual-desktop physical pixels under the Per-Monitor V2 manifest.
@@ -131,6 +145,10 @@ impl Overlay {
             cursor,
             scene,
             selection,
+            editor: Editor::default(),
+            text: None,
+            text_resize: None,
+            custom_colors: [COLORREF(0x00ff_ffff); 16],
             default_action,
             pressed_button: None,
             renderer: Some(renderer),
@@ -161,9 +179,7 @@ impl Overlay {
         Ok(Self { hwnd, session })
     }
 
-    pub fn take_outcome(
-        &mut self,
-    ) -> Option<anyhow::Result<(SelectionOutcome, Vec<CapturedMonitor>)>> {
+    pub fn take_outcome(&mut self) -> Option<anyhow::Result<SelectionResult>> {
         let mut session = self.session.try_borrow_mut().ok()?;
         let outcome = session.outcome.take()?;
         Some(outcome.map(|outcome| {
@@ -172,7 +188,11 @@ impl Overlay {
             } else {
                 Vec::new()
             };
-            (outcome, frames)
+            SelectionResult {
+                outcome,
+                frames,
+                annotations: session.editor.take_document(),
+            }
         }))
     }
 }
@@ -188,6 +208,7 @@ impl Drop for Overlay {
                 SetWindowLongPtrW(self.hwnd, GWLP_USERDATA, 0);
                 drop(Rc::from_raw(attached as *const RefCell<Session>));
                 if let Ok(mut state) = self.session.try_borrow_mut() {
+                    state.text.take();
                     state.renderer.take();
                     if state.drag_frames > 0 {
                         crate::logging::debug(format!(
@@ -228,7 +249,7 @@ impl Session {
     }
 
     fn confirm(&mut self, action: OutputAction) {
-        if !self.selection.dragging() {
+        if !self.selection.dragging() && !self.editor.dragging() {
             if let Some(rect) = self.selection.saved_rect() {
                 self.finish(Ok(SelectionOutcome::Confirmed { rect, action }));
             }
@@ -236,17 +257,34 @@ impl Session {
     }
 
     fn refresh(&mut self, hwnd: HWND) {
-        let next = Scene::new(
+        let mut next = Scene::new(
             &self.frames,
             &self.ui,
             &self.selection,
             self.cursor,
-            self.pressed_button,
+            ToolbarState {
+                pressed: self.pressed_button,
+                active_tool: self.editor.tool,
+                can_undo: self.editor.can_undo(),
+                can_redo: self.editor.can_redo(),
+                editing: self.editor.locks_selection(),
+                text_style: self.editor.text_style,
+                stroke_style: self.editor.stroke_style,
+            },
         );
-        if let Some(damage) = next
-            .damage_from(&self.scene, &self.frames)
-            .and_then(|rect| rect.intersect(self.bounds))
-        {
+        next.text_grip = self
+            .text
+            .as_ref()
+            .and_then(TextInput::grip)
+            .map(|grip| grip.offset(self.bounds.left, self.bounds.top));
+        if let Some(damage) = next.damage_from(&self.scene, &self.frames) {
+            self.invalidate(hwnd, damage);
+        }
+        self.scene = next;
+    }
+
+    fn invalidate(&self, hwnd: HWND, damage: Rect) {
+        if let Some(damage) = damage.intersect(self.bounds) {
             let area = damage.offset(-self.bounds.left, -self.bounds.top);
             let area = RECT {
                 left: area.left,
@@ -259,11 +297,21 @@ impl Session {
                 let _ = InvalidateRect(Some(hwnd), Some(&area), false);
             }
         }
-        self.scene = next;
+    }
+
+    fn invalidate_annotation(&self, hwnd: HWND, local: Option<Rect>) {
+        if let (Some(local), Some(selection)) = (local, self.selection.saved_rect()) {
+            if let Some(rect) = local
+                .offset(selection.left, selection.top)
+                .intersect(selection)
+            {
+                self.invalidate(hwnd, rect);
+            }
+        }
     }
 
     fn paint(&mut self, hwnd: HWND) {
-        let started = (self.selection.dragging()
+        let started = ((self.selection.dragging() || self.editor.dragging())
             && crate::logging::current_level() >= crate::logging::Level::Debug)
             .then(Instant::now);
         let paint = match Paint::begin(hwnd) {
@@ -322,8 +370,13 @@ impl Session {
             Rect::new(dirty.left, dirty.top, dirty.right, dirty.bottom)
                 .offset(self.bounds.left, self.bounds.top)
         };
-        if let Some(renderer) = &self.renderer {
-            renderer.paint(dirty, &self.frames, &self.scene)?;
+        if let Some(renderer) = &mut self.renderer {
+            renderer.paint(
+                dirty,
+                &self.frames,
+                &self.scene,
+                Some((&self.factory, &self.editor)),
+            )?;
         }
         Ok(())
     }
@@ -347,18 +400,215 @@ impl Session {
         };
         let step = if shift { 10 } else { 1 };
         let delta = match key {
+            VK_ESCAPE if self.editor.dragging() => {
+                let damage = self.editor.cancel_gesture();
+                self.invalidate_annotation(hwnd, damage);
+                self.release_mouse(hwnd);
+                return self.refresh(hwnd);
+            }
             VK_ESCAPE => return self.finish(Ok(SelectionOutcome::Cancelled)),
             VK_RETURN => return self.confirm(self.default_action),
             VK_S if ctrl => return self.confirm(OutputAction::SaveAs),
             VK_T if ctrl => return self.confirm(OutputAction::PinAndCopy),
             VK_T => return self.confirm(OutputAction::Pin),
+            VK_Z if ctrl => return self.history(hwnd, shift),
+            VK_Y if ctrl => return self.history(hwnd, true),
             VK_LEFT => Point::new(-step, 0),
             VK_RIGHT => Point::new(step, 0),
             VK_UP => Point::new(0, -step),
             VK_DOWN => Point::new(0, step),
             _ => return,
         };
-        self.selection.nudge(self.bounds, delta, ctrl);
+        if !self.editor.locks_selection() {
+            self.selection.nudge(self.bounds, delta, ctrl);
+            self.refresh(hwnd);
+        }
+    }
+
+    fn history(&mut self, hwnd: HWND, redo: bool) {
+        if self.editor.dragging() {
+            return;
+        }
+        self.finish_text(hwnd, true);
+        let damage = if redo {
+            self.editor.redo()
+        } else {
+            self.editor.undo()
+        };
+        self.invalidate_annotation(hwnd, damage);
+        self.refresh(hwnd);
+    }
+
+    fn release_mouse(&self, hwnd: HWND) {
+        // SAFETY: release only the capture owned by this window on this thread.
+        unsafe {
+            if GetCapture() == hwnd {
+                let _ = ReleaseCapture();
+            }
+        }
+    }
+
+    fn begin_edit(&mut self, hwnd: HWND, point: Point) {
+        let (Some(tool), Some(selection)) = (self.editor.tool, self.selection.saved_rect()) else {
+            return;
+        };
+        if !selection.contains(point) || self.editor.dragging() {
+            return;
+        }
+        let point = local_point(point, selection);
+        if tool == Tool::Text {
+            let canvas = selection.offset(-self.bounds.left, -self.bounds.top);
+            let toolbar = self
+                .scene
+                .toolbar
+                .map(|bar| bar.rect.offset(-self.bounds.left, -self.bounds.top));
+            match TextInput::new(hwnd, canvas, point, self.editor.text_style, toolbar) {
+                Ok(input) => self.text = Some(input),
+                Err(err) => {
+                    crate::logging::warn(format!("could not open annotation text input: {err:#}"))
+                }
+            }
+        } else {
+            // SAFETY: capture the gesture until mouse-up on this thread.
+            unsafe {
+                SetCapture(hwnd);
+                if GetCapture() != hwnd {
+                    return;
+                }
+            }
+            let damage = self.editor.begin(tool, point);
+            self.invalidate_annotation(hwnd, Some(damage));
+        }
+        self.refresh(hwnd);
+    }
+
+    fn finish_text(&mut self, hwnd: HWND, commit: bool) {
+        let Some(mut text) = self.text.take() else {
+            return;
+        };
+        if self.text_resize.take().is_some() {
+            self.release_mouse(hwnd);
+        }
+        let damage = if commit {
+            if let Err(err) = text.text_changed() {
+                crate::logging::warn(format!("could not measure final annotation text: {err:#}"));
+            }
+            self.editor
+                .add_text(text.area(), text.units(), self.editor.text_style)
+        } else {
+            None
+        };
+        drop(text);
+        // SAFETY: focus returns to the live parent after closing its edit child.
+        unsafe {
+            let _ = SetFocus(Some(hwnd));
+        }
+        self.invalidate_annotation(hwnd, damage);
+        self.refresh(hwnd);
+    }
+
+    fn press_text_grip(&mut self, hwnd: HWND, point: Point, reset: bool) -> bool {
+        let Some(grip) = self.scene.text_grip.filter(|grip| grip.contains(point)) else {
+            return false;
+        };
+        let Some(input) = &mut self.text else {
+            return false;
+        };
+        if reset {
+            if let Err(err) = input.resize(None) {
+                crate::logging::warn(format!("could not reset annotation text width: {err:#}"));
+            }
+            self.refresh(hwnd);
+        } else {
+            // SAFETY: mouse capture is scoped to the overlay on its owning thread.
+            unsafe {
+                SetCapture(hwnd);
+                if GetCapture() == hwnd {
+                    self.text_resize = Some(grip.left - point.x);
+                }
+            }
+        }
+        true
+    }
+
+    fn drag_text_grip(&mut self) {
+        if let (Some(offset), Some(input)) = (self.text_resize, &mut self.text) {
+            let width = self.cursor.x - self.bounds.left + offset - input.left();
+            if let Err(err) = input.resize(Some(width)) {
+                crate::logging::warn(format!("could not resize annotation text: {err:#}"));
+            }
+        }
+    }
+
+    fn style_option(&mut self, hwnd: HWND, button: ToolbarButton, point: Point) {
+        let mut text_style = self.editor.text_style;
+        let mut stroke_style = self.editor.stroke_style;
+        let editing_text = self.editor.tool == Some(Tool::Text);
+        match button {
+            ToolbarButton::TextSize => match choose_size(hwnd, point, text_style.size_px) {
+                Ok(Some(size)) => text_style.size_px = size,
+                Ok(None) => {}
+                Err(err) => {
+                    crate::logging::warn(format!("could not open annotation font sizes: {err:#}"))
+                }
+            },
+            ToolbarButton::StrokeWidth => match choose_width(hwnd, point, stroke_style.width) {
+                Ok(Some(width)) => stroke_style.width = width,
+                Ok(None) => {}
+                Err(err) => crate::logging::warn(format!(
+                    "could not open annotation stroke widths: {err:#}"
+                )),
+            },
+            ToolbarButton::Color => {
+                let current = if editing_text {
+                    &mut text_style.rgb
+                } else {
+                    &mut stroke_style.rgb
+                };
+                if let Some(rgb) = choose_color(hwnd, *current, &mut self.custom_colors) {
+                    *current = rgb;
+                }
+            }
+            _ => return,
+        }
+        // SAFETY: the native menus run a nested message loop; validate the owner afterward.
+        if !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
+            return;
+        }
+        if let Some(input) = &mut self.text {
+            if let Err(err) = input.set_style(text_style) {
+                crate::logging::warn(format!("could not apply annotation text style: {err:#}"));
+                text_style = self.editor.text_style;
+            }
+            input.focus();
+        }
+        self.editor.text_style = text_style;
+        self.editor.stroke_style = stroke_style;
+        self.refresh(hwnd);
+    }
+
+    fn forward_text_press(&self, point: Point, msg: u32, wp: WPARAM) -> bool {
+        self.text.as_ref().is_some_and(|input| {
+            input.forward_press(
+                Point::new(point.x - self.bounds.left, point.y - self.bounds.top),
+                msg,
+                wp,
+            )
+        })
+    }
+
+    fn press_canvas(&mut self, hwnd: HWND, point: Point) {
+        self.finish_text(hwnd, true);
+        self.cursor = point;
+        if self.editor.locks_selection() {
+            return self.begin_edit(hwnd, point);
+        }
+        let hit = hit_test(&self.frames, self.selection.rect, point);
+        self.selection.begin(point, self.bounds, hit);
+        // SAFETY: acquire mouse capture on this UI thread.
+        unsafe {
+            SetCapture(hwnd);
+        }
         self.refresh(hwnd);
     }
 
@@ -385,16 +635,26 @@ impl Session {
         let pressed = self.pressed_button.take();
         self.cursor = point;
         let released = self.scene.toolbar.and_then(|bar| bar.button_at(point));
-        // SAFETY: clear the pressed state before releasing this window's capture.
-        unsafe {
-            if GetCapture() == hwnd {
-                let _ = ReleaseCapture();
-            }
+        self.release_mouse(hwnd);
+        let clicked = pressed.filter(|button| Some(*button) == released);
+        if clicked.is_some_and(|button| !button.is_style_option()) {
+            self.finish_text(hwnd, true);
         }
-        match pressed.filter(|button| Some(*button) == released) {
+        match clicked {
             Some(ToolbarButton::Copy) => self.confirm(OutputAction::Copy),
             Some(ToolbarButton::Save) => self.confirm(OutputAction::SaveAs),
             Some(ToolbarButton::Pin) => self.confirm(OutputAction::Pin),
+            Some(ToolbarButton::Undo) => self.history(hwnd, false),
+            Some(ToolbarButton::Redo) => self.history(hwnd, true),
+            Some(
+                button @ (ToolbarButton::TextSize
+                | ToolbarButton::StrokeWidth
+                | ToolbarButton::Color),
+            ) => self.style_option(hwnd, button, point),
+            Some(ToolbarButton::Tool(tool)) => {
+                self.editor.tool = (self.editor.tool != Some(tool)).then_some(tool);
+                self.refresh(hwnd);
+            }
             None => self.refresh(hwnd),
         }
     }
@@ -409,24 +669,52 @@ impl Session {
             WM_PAINT => self.paint(hwnd),
             WM_LBUTTONDOWN => {
                 let point = self.mouse_point(lp);
-                if !self.press_toolbar(hwnd, point) {
-                    self.cursor = point;
-                    let hit = hit_test(&self.frames, self.selection.rect, point);
-                    self.selection.begin(point, self.bounds, hit);
-                    // SAFETY: acquire mouse capture on this UI thread.
-                    unsafe {
-                        SetCapture(hwnd);
-                    }
-                    self.refresh(hwnd);
+                if !self.press_toolbar(hwnd, point)
+                    && !self.press_text_grip(hwnd, point, false)
+                    && !self.forward_text_press(point, msg, wp)
+                {
+                    self.press_canvas(hwnd, point);
                 }
             }
             WM_MOUSEMOVE => {
                 self.cursor = self.mouse_point(lp);
-                self.selection.update(self.cursor, self.bounds);
+                if self.text_resize.is_some() {
+                    self.drag_text_grip();
+                } else if self.editor.dragging() {
+                    if let Some(selection) = self.selection.saved_rect() {
+                        let damage = self.editor.update(local_point(self.cursor, selection));
+                        self.invalidate_annotation(hwnd, damage);
+                    }
+                } else {
+                    self.selection.update(self.cursor, self.bounds);
+                }
                 self.refresh(hwnd);
             }
             WM_LBUTTONUP if self.pressed_button.is_some() => {
                 self.release_toolbar(hwnd, self.mouse_point(lp));
+            }
+            WM_LBUTTONUP if self.text_resize.is_some() => {
+                self.cursor = self.mouse_point(lp);
+                self.drag_text_grip();
+                self.text_resize = None;
+                self.release_mouse(hwnd);
+                if let Some(input) = &self.text {
+                    input.focus();
+                }
+                self.refresh(hwnd);
+            }
+            WM_LBUTTONUP if self.editor.dragging() => {
+                self.cursor = self.mouse_point(lp);
+                if let Some(selection) = self.selection.saved_rect() {
+                    let damage = self.editor.finish(
+                        local_point(self.cursor, selection),
+                        selection,
+                        &self.frames,
+                    );
+                    self.invalidate_annotation(hwnd, damage);
+                }
+                self.release_mouse(hwnd);
+                self.refresh(hwnd);
             }
             WM_LBUTTONUP if self.selection.dragging() => {
                 self.cursor = self.mouse_point(lp);
@@ -445,21 +733,52 @@ impl Session {
             WM_LBUTTONDBLCLK => {
                 let cursor = self.mouse_point(lp);
                 if !self.press_toolbar(hwnd, cursor)
-                    && self
+                    && !self.press_text_grip(hwnd, cursor, true)
+                    && !self.forward_text_press(cursor, msg, wp)
+                {
+                    if self.editor.tool.is_some() {
+                        self.press_canvas(hwnd, cursor);
+                    } else if self
                         .selection
                         .rect
                         .is_some_and(|rect| rect.contains(cursor))
-                {
-                    self.confirm(self.default_action);
+                    {
+                        self.confirm(self.default_action);
+                    }
                 }
             }
             WM_SETCURSOR => {
                 let cursor = cursor_position().unwrap_or(self.cursor);
-                let system_cursor = if let Some(toolbar) =
+                let system_cursor = if self.text_resize.is_some()
+                    || self
+                        .scene
+                        .text_grip
+                        .is_some_and(|grip| grip.contains(cursor))
+                {
+                    IDC_SIZEWE
+                } else if let Some(toolbar) =
                     self.scene.toolbar.filter(|bar| bar.rect.contains(cursor))
                 {
                     if toolbar.button_at(cursor).is_some() {
                         IDC_HAND
+                    } else {
+                        IDC_ARROW
+                    }
+                } else if self.text.as_ref().is_some_and(|input| {
+                    input.contains(Point::new(
+                        cursor.x - self.bounds.left,
+                        cursor.y - self.bounds.top,
+                    ))
+                }) {
+                    IDC_IBEAM
+                } else if self.editor.locks_selection() {
+                    if self.editor.tool.is_some()
+                        && self
+                            .selection
+                            .rect
+                            .is_some_and(|rect| rect.contains(cursor))
+                    {
+                        IDC_CROSS
                     } else {
                         IDC_ARROW
                     }
@@ -475,12 +794,39 @@ impl Session {
                 return Some(LRESULT(1));
             }
             WM_KEYDOWN => self.key(hwnd, VIRTUAL_KEY(wp.0 as u16)),
+            WM_TEXT_CHANGED => {
+                if let Some(input) = self
+                    .text
+                    .as_mut()
+                    .filter(|input| input.hwnd.0 as usize == wp.0)
+                {
+                    if let Err(err) = input.text_changed() {
+                        crate::logging::warn(format!("could not grow annotation text: {err:#}"));
+                    }
+                    self.refresh(hwnd);
+                }
+            }
+            WM_TEXT_FINISHED => {
+                if self
+                    .text
+                    .as_ref()
+                    .is_some_and(|text| text.hwnd.0 as usize == wp.0)
+                {
+                    self.finish_text(hwnd, lp.0 != 0);
+                }
+            }
             WM_RBUTTONDOWN | WM_DISPLAYCHANGE | WM_CLOSE | WM_CANCELMODE => {
                 self.finish(Ok(SelectionOutcome::Cancelled));
             }
             WM_CAPTURECHANGED if self.selection.dragging() => {
                 self.finish(Ok(SelectionOutcome::Cancelled))
             }
+            WM_CAPTURECHANGED if self.editor.dragging() => {
+                let damage = self.editor.cancel_gesture();
+                self.invalidate_annotation(hwnd, damage);
+                self.refresh(hwnd);
+            }
+            WM_CAPTURECHANGED if self.text_resize.take().is_some() => self.refresh(hwnd),
             WM_CAPTURECHANGED if self.pressed_button.take().is_some() => self.refresh(hwnd),
             WM_DPICHANGED => {
                 crate::logging::debug("overlay retained physical coordinates after WM_DPICHANGED")
@@ -542,6 +888,24 @@ impl Drop for Paint {
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    // An edit can ask for colors synchronously while its session is borrowed.
+    if msg == WM_CTLCOLOREDIT {
+        if let Some(result) = edit_colors(HWND(lp.0 as *mut _), HDC(wp.0 as *mut _)) {
+            return result;
+        }
+    }
+    if msg == WM_COMMAND && ((wp.0 >> 16) & 0xffff) == EN_CHANGE && lp.0 != 0 {
+        // SAFETY: defer sizing until the native edit finishes processing the input.
+        let _ = unsafe {
+            PostMessageW(
+                Some(hwnd),
+                WM_TEXT_CHANGED,
+                WPARAM(lp.0 as usize),
+                LPARAM(0),
+            )
+        };
+        return LRESULT(0);
+    }
     // SAFETY: the pointer, if attached, belongs to the live Overlay.
     let raw = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *const RefCell<Session>;
     if raw.is_null() {
@@ -640,5 +1004,69 @@ fn activate(hwnd: HWND) {
         } else {
             crate::logging::debug("overlay will activate on mouse click");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        MSG, PM_REMOVE, PeekMessageW, SendMessageW, WINDOW_EX_STYLE, WM_CHAR,
+    };
+
+    use super::*;
+    use crate::annotation::TextStyle;
+
+    #[test]
+    fn native_edit_notifies_overlay_to_resize_after_typing() -> anyhow::Result<()> {
+        let instance = register_class()?;
+        // SAFETY: the test owns this hidden window on its UI thread.
+        let owner = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                CLASS,
+                w!(""),
+                WS_POPUP,
+                0,
+                0,
+                420,
+                120,
+                None,
+                None,
+                Some(instance),
+                None,
+            )?
+        };
+        let result = (|| {
+            let input = TextInput::new(
+                owner,
+                Rect::new(0, 0, 400, 100),
+                Point::default(),
+                TextStyle::default(),
+                None,
+            )?;
+            let mut message = MSG::default();
+            // SAFETY: dispatch a typed character directly to the live child edit.
+            unsafe {
+                SendMessageW(input.hwnd, WM_CHAR, Some(WPARAM(b'M' as usize)), None);
+                assert!(
+                    PeekMessageW(
+                        &mut message,
+                        Some(owner),
+                        WM_TEXT_CHANGED,
+                        WM_TEXT_CHANGED,
+                        PM_REMOVE,
+                    )
+                    .as_bool()
+                );
+            }
+            assert_eq!(message.wParam.0, input.hwnd.0 as usize);
+            assert_eq!(input.units(), [u16::from(b'M')]);
+            Ok(())
+        })();
+        // SAFETY: the edit child is gone and the test still owns the parent.
+        unsafe {
+            DestroyWindow(owner)?;
+        }
+        result
     }
 }

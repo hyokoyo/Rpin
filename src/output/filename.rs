@@ -24,7 +24,13 @@ fn render_stem(template: &str, time: SYSTEMTIME) -> String {
     }
     let name = name.trim_matches([' ', '.']);
     let name = match name.rsplit_once('.') {
-        Some((stem, extension)) if extension.eq_ignore_ascii_case("png") => stem,
+        Some((stem, extension))
+            if ["png", "jpg", "jpeg"]
+                .iter()
+                .any(|candidate| extension.eq_ignore_ascii_case(candidate)) =>
+        {
+            stem
+        }
         _ => name,
     };
     // Bound UTF-16 units, leaving room for a collision suffix and extension.

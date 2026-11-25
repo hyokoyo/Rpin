@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod annotation;
 mod app;
 mod capture;
 mod capture_test;
@@ -154,7 +155,7 @@ fn command_from_args(args: impl Iterator<Item = std::ffi::OsString>) -> String {
 fn install_panic_hook() {
     std::panic::set_hook(Box::new(|info| {
         let message = format!("panic: {info}");
-        if std::thread::current().name() == Some(output::png_writer::THREAD_NAME) {
+        if std::thread::current().name() == Some(output::save::THREAD_NAME) {
             logging::error(&message);
             return;
         }
