@@ -1,4 +1,5 @@
 pub mod autostart;
+pub(crate) mod capture_windows;
 pub mod clipboard;
 pub mod com;
 pub mod hotkey;

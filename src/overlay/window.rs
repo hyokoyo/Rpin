@@ -33,6 +33,7 @@ use crate::capture::{
 };
 use crate::config::UiConfig;
 use crate::output::{OutputAction, SelectionOutcome};
+use crate::platform::capture_windows::{WindowTargets, drag_threshold};
 use crate::platform::window::{default_proc, hinstance};
 
 use super::input::{Handle, Hit};
@@ -86,6 +87,7 @@ impl Overlay {
     pub fn show(
         owner: HWND,
         frames: Vec<CapturedMonitor>,
+        window_targets: WindowTargets,
         ui: UiConfig,
         default_action: OutputAction,
         started: Instant,
@@ -102,7 +104,7 @@ impl Overlay {
             "virtual desktop exceeds the overlay limit (16384px)"
         );
         let cursor = cursor_position().unwrap_or(Point::new(bounds.left, bounds.top));
-        let interaction = Interaction::new(cursor, default_action);
+        let interaction = Interaction::new(cursor, default_action, window_targets.clipped(bounds));
         let scene = interaction.scene(&frames, &ui);
         let instance = register_class()?;
         // SAFETY: the class is registered and the top-level window uses
@@ -549,10 +551,14 @@ impl Session {
             return;
         } else {
             self.finish_text(hwnd, true);
-            self.interaction
-                .press_canvas(point, double_click, self.bounds, &self.frames, || {
-                    capture_mouse(hwnd)
-                })
+            self.interaction.press_canvas(
+                point,
+                double_click,
+                self.bounds,
+                &self.frames,
+                || capture_mouse(hwnd),
+                drag_threshold,
+            )
         };
         self.apply_change(hwnd, change);
     }

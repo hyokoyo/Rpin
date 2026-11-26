@@ -21,6 +21,7 @@ use crate::output::save::SaveWorker;
 use crate::output::{ImageFormat, OutputAction, OutputError, SelectionOutcome, crop, filename};
 use crate::overlay::{Direct2dCache, Overlay};
 use crate::pins::NativePinManager;
+use crate::platform::capture_windows::WindowTargets;
 use crate::platform::hotkey::Hotkey;
 use crate::platform::single_instance::SingleInstance;
 use crate::platform::tray::{Tray, TrayMenuState};
@@ -216,6 +217,7 @@ impl App {
         }
         let started = Instant::now();
         self.pins.hide_all_for_capture();
+        let window_targets = WindowTargets::snapshot();
         let frames = GdiCapture::new().capture_all();
         self.pins.restore_after_capture();
         match frames.map_err(anyhow::Error::from).and_then(|frames| {
@@ -223,6 +225,7 @@ impl App {
             Overlay::show(
                 self.hwnd,
                 frames,
+                window_targets,
                 self.config.ui.clone(),
                 default_action,
                 started,

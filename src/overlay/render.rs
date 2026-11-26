@@ -195,14 +195,12 @@ impl Renderer {
             self.target.FillRectangle(&self.client(dirty), &self.black);
             // Annotation gestures usually invalidate a small area inside the
             // selection. In that case draw the undimmed desktop only once.
-            if !scene
-                .selection
-                .is_some_and(|rect| rect.intersect(dirty) == Some(dirty))
-            {
+            let highlighted = scene.highlighted_rect();
+            if !highlighted.is_some_and(|rect| rect.intersect(dirty) == Some(dirty)) {
                 self.draw_desktop(frames, dirty);
                 self.target.FillRectangle(&self.client(dirty), &self.dim);
             }
-            if let Some(rect) = scene.selection {
+            if let Some(rect) = highlighted {
                 if let Some(visible) = dirty.intersect(rect) {
                     self.target
                         .PushAxisAlignedClip(&self.client(visible), D2D1_ANTIALIAS_MODE_ALIASED);
@@ -218,7 +216,7 @@ impl Renderer {
                     self.target.PopAxisAlignedClip();
                 }
                 self.outline(rect);
-                if !scene.editing {
+                if !scene.editing && scene.selection.is_some() {
                     for (_, _, handle) in handles(frames, rect) {
                         self.target.FillRectangle(&self.client(handle), &self.white);
                         self.target.DrawRectangle(
@@ -584,12 +582,21 @@ mod tests {
             &frames,
             &ui,
             &selection,
+            None,
             Point::new(-230, 225),
             Default::default(),
         );
         assert!(scene.label.is_some());
         assert!(scene.magnifier.is_some());
         assert!(scene.toolbar.is_some());
+        let preview = Scene::new(
+            &frames,
+            &ui,
+            &Selection::default(),
+            selection.saved_rect(),
+            Point::new(-230, 225),
+            Default::default(),
+        );
         // SAFETY: STATIC is a predefined class, and the test leaves the window hidden.
         let hwnd = unsafe {
             CreateWindowExW(
@@ -610,7 +617,11 @@ mod tests {
         let paint = (|| {
             let mut cache = crate::overlay::Direct2dCache::new(hwnd);
             let mut renderer = Renderer::new(&cache.factory()?, hwnd, bounds, &frames, &ui)?;
-            renderer.paint(bounds, &frames, &scene, None)?;
+            renderer.paint(bounds, &frames, &preview, None)?;
+            let damage = scene
+                .damage_from(&preview, &frames)
+                .expect("selection controls need repaint");
+            renderer.paint(damage, &frames, &scene, None)?;
             renderer.paint(Rect::new(0, 90, 220, 150), &frames, &scene, None)?;
             Ok(())
         })();

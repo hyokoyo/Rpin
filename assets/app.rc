@@ -26,12 +26,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "RPin"
             VALUE "FileDescription", "RPin Screenshot Tool"
-            VALUE "FileVersion", "1.2.1.0"
+            VALUE "FileVersion", "1.3.0.0"
             VALUE "InternalName", "rpin"
             VALUE "LegalCopyright", "Copyright (C) 2026"
             VALUE "OriginalFilename", "rpin.exe"
             VALUE "ProductName", "RPin"
-            VALUE "ProductVersion", "1.2.1.0"
+            VALUE "ProductVersion", "1.3.0.0"
         END
     END
     BLOCK "VarFileInfo"

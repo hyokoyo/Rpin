@@ -234,6 +234,7 @@ impl Toolbar {
 #[derive(Default, PartialEq, Eq)]
 pub(super) struct Scene {
     pub selection: Option<Rect>,
+    pub window_preview: Option<Rect>,
     pub label: Option<Label>,
     pub magnifier: Option<Magnifier>,
     pub toolbar: Option<Toolbar>,
@@ -246,6 +247,7 @@ impl Scene {
         frames: &[CapturedMonitor],
         ui: &UiConfig,
         selection: &Selection,
+        window_preview: Option<Rect>,
         cursor: Point,
         controls: ToolbarState,
     ) -> Self {
@@ -258,6 +260,7 @@ impl Scene {
         };
         let selection = selection.rect;
         let label = selection
+            .or(window_preview)
             .filter(|_| ui.show_size && !controls.editing)
             .and_then(|rect| {
                 let monitor = monitor_for_rect(frames, rect)?;
@@ -290,6 +293,7 @@ impl Scene {
         };
         Self {
             selection,
+            window_preview,
             label,
             magnifier,
             toolbar,
@@ -298,8 +302,13 @@ impl Scene {
         }
     }
 
+    pub(super) fn highlighted_rect(&self) -> Option<Rect> {
+        self.selection.or(self.window_preview)
+    }
+
     pub(super) fn damage_from(&self, previous: &Self, frames: &[CapturedMonitor]) -> Option<Rect> {
         let selection_changed = self.selection != previous.selection
+            || self.window_preview != previous.window_preview
             || self.label != previous.label
             || self.editing != previous.editing;
         let magnifier_changed = self.magnifier != previous.magnifier;
@@ -308,13 +317,22 @@ impl Scene {
         [self, previous]
             .into_iter()
             .flat_map(|scene| {
-                let selection = scene.selection.filter(|_| selection_changed).map(|rect| {
-                    handles(frames, rect)
-                        .into_iter()
-                        .fold(inflate(rect, 3), |area, (_, _, handle)| {
-                            area.union(inflate(handle, 2))
-                        })
-                });
+                let selection =
+                    scene
+                        .highlighted_rect()
+                        .filter(|_| selection_changed)
+                        .map(|rect| {
+                            let area = inflate(rect, 3);
+                            if scene.selection.is_some() {
+                                handles(frames, rect)
+                                    .into_iter()
+                                    .fold(area, |area, (_, _, handle)| {
+                                        area.union(inflate(handle, 2))
+                                    })
+                            } else {
+                                area
+                            }
+                        });
                 let label = scene
                     .label
                     .filter(|_| selection_changed)
@@ -532,6 +550,7 @@ mod tests {
             &frames,
             &ui,
             &selection,
+            None,
             Point::default(),
             ToolbarState::default(),
         );
@@ -545,6 +564,7 @@ mod tests {
             &frames,
             &ui,
             &selection,
+            None,
             cursor,
             ToolbarState {
                 pressed: Some(ToolbarButton::Copy),
@@ -555,9 +575,44 @@ mod tests {
 
         let inside = Point::new(-400, -300);
         selection.begin(inside, bounds, Hit::Inside);
-        let dragging = Scene::new(&frames, &ui, &selection, inside, ToolbarState::default());
+        let dragging = Scene::new(
+            &frames,
+            &ui,
+            &selection,
+            None,
+            inside,
+            ToolbarState::default(),
+        );
         assert!(dragging.toolbar.is_none());
         assert_eq!(dragging.damage_from(&hovered, &frames), Some(bar.rect));
+    }
+
+    #[test]
+    fn window_preview_only_adds_damage_when_its_rectangle_changes() {
+        let ui = UiConfig {
+            magnifier: false,
+            show_size: false,
+            ..UiConfig::default()
+        };
+        let selection = Selection::default();
+        let left = Rect::new(-320, 40, -40, 200);
+        let right = Rect::new(0, 40, 330, 200);
+        let preview = |rect, x| {
+            Scene::new(
+                &[],
+                &ui,
+                &selection,
+                Some(rect),
+                Point::new(x, 70),
+                ToolbarState::default(),
+            )
+        };
+        let first = preview(left, -120);
+        assert_eq!(preview(left, -80).damage_from(&first, &[]), None);
+        assert_eq!(
+            preview(right, 70).damage_from(&first, &[]),
+            Some(inflate(left.union(right), 3))
+        );
     }
 
     #[test]
